@@ -1,7 +1,8 @@
-//! Freehand drawing on top of a page.
+//! What sits on top of a page: the pen, links, text selection and search
+//! matches, plus the wheel handling over the document.
 
 use crate::Message;
-use crate::pdf::Link;
+use crate::pdf::{Link, PageText};
 use iced::mouse::{self, Cursor};
 use iced::widget::canvas::{self, Action, Event, Frame, Geometry, Path, Program};
 use iced::{Color, Point, Rectangle, Renderer, Size, Theme, Vector};
@@ -43,13 +44,8 @@ fn to_page(rotation: u16, p: Point, size: Size) -> (f32, f32) {
 
 impl Ink<'_> {
 
-    fn to_screen(&self, (u, v): (f32, f32), size: Size) -> Point {
-        let (x, y) = match self.rotation {
-            90 => (1.0 - v, u),
-            180 => (1.0 - u, 1.0 - v),
-            270 => (v, 1.0 - u),
-            _ => (u, v),
-        };
+    fn to_screen(&self, point: (f32, f32), size: Size) -> Point {
+        let (x, y) = turned(self.rotation, point);
         Point::new(x * size.width, y * size.height)
     }
 
@@ -140,14 +136,53 @@ impl Program<Message> for Ink<'_> {
     }
 }
 
-/// The clickable links of one page. Left out while drawing, so the pen can
-/// draw over links.
-pub struct Links<'a> {
-    pub links: &'a [Link],
-    pub rotation: u16,
+/// Turns a point given as fractions of the unrotated page into fractions of
+/// the page as turned on screen.
+fn turned(rotation: u16, (u, v): (f32, f32)) -> (f32, f32) {
+    match rotation {
+        90 => (1.0 - v, u),
+        180 => (1.0 - u, 1.0 - v),
+        270 => (v, 1.0 - u),
+        _ => (u, v),
+    }
 }
 
-impl Links<'_> {
+/// A box given as fractions of the unrotated page (left, top, right, bottom),
+/// as fractions of the page turned on screen.
+pub fn turned_box(rotation: u16, [left, top, right, bottom]: [f32; 4]) -> [f32; 4] {
+    let (x0, y0) = turned(rotation, (left, top));
+    let (x1, y1) = turned(rotation, (right, bottom));
+    [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)]
+}
+
+/// Everything on top of a page besides the pen: links to click, text to
+/// select, and the selection and search matches. Left out while drawing, so
+/// the pen can draw over links and text.
+pub struct Overlay<'a> {
+    pub page: usize,
+    pub links: &'a [Link],
+    pub text: Option<&'a PageText>,
+    pub rotation: u16,
+    /// A selection is being dragged out.
+    pub selecting: bool,
+    /// Boxes to highlight, as fractions of the unrotated page.
+    pub selected: Vec<[f32; 4]>,
+    pub found: Vec<[f32; 4]>,
+    /// The search match the find bar is on.
+    pub current: Vec<[f32; 4]>,
+}
+
+/// Selection blue, and pdf.js's colors for search matches.
+const SELECTED: Color = Color::from_rgba(0.0, 0.4, 1.0, 0.3);
+const FOUND: Color = Color::from_rgba(0.71, 0.0, 0.67, 0.25);
+const CURRENT: Color = Color::from_rgba(0.0, 0.39, 0.0, 0.3);
+
+/// Clicks this close together (and in this little space) count as one double
+/// or triple click.
+const MULTI_CLICK: std::time::Duration = std::time::Duration::from_millis(500);
+const MULTI_CLICK_DISTANCE: f32 = 4.0;
+
+impl Overlay<'_> {
     fn under(&self, bounds: Rectangle, cursor: Cursor) -> Option<&Link> {
         let (x, y) = to_page(self.rotation, cursor.position_in(bounds)?, bounds.size());
         let inside = |link: &&Link| {
@@ -156,23 +191,79 @@ impl Links<'_> {
         };
         self.links.iter().find(inside)
     }
+
+    fn over_text(&self, bounds: Rectangle, cursor: Cursor) -> bool {
+        let (Some(text), Some(p)) = (self.text, cursor.position_in(bounds)) else { return false };
+        let (x, y) = to_page(self.rotation, p, bounds.size());
+        text.lines.iter().any(|&(_, _, [left, top, right, bottom])| {
+            (left..=right).contains(&x) && (top..=bottom).contains(&y)
+        })
+    }
 }
 
-impl Program<Message> for Links<'_> {
-    type State = ();
+impl Program<Message> for Overlay<'_> {
+    /// The last press, for telling double and triple clicks: when, where and
+    /// how many in a row.
+    type State = Option<(std::time::Instant, Point, u8)>;
 
-    fn update(&self, _: &mut (), event: &Event, bounds: Rectangle, cursor: Cursor) -> Option<Action<Message>> {
-        let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event else { return None };
-        let link = self.under(bounds, cursor)?;
-        Some(Action::publish(Message::FollowLink(link.target.clone())).and_capture())
+    fn update(&self, last: &mut Self::State, event: &Event, bounds: Rectangle, cursor: Cursor) -> Option<Action<Message>> {
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                let p = cursor.position_in(bounds)?;
+                if let Some(link) = self.under(bounds, cursor) {
+                    return Some(Action::publish(Message::FollowLink(link.target.clone())).and_capture());
+                }
+                let now = std::time::Instant::now();
+                let clicks = match *last {
+                    Some((at, where_, clicks))
+                        if now.duration_since(at) < MULTI_CLICK && where_.distance(p) < MULTI_CLICK_DISTANCE =>
+                    {
+                        clicks % 3 + 1
+                    }
+                    _ => 1,
+                };
+                *last = Some((now, p, clicks));
+                let at = to_page(self.rotation, p, bounds.size());
+                Some(Action::publish(Message::SelectStart(self.page, at, clicks)).and_capture())
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) if self.selecting => {
+                let p = cursor.position_in(bounds)?;
+                Some(Action::publish(Message::SelectTo(self.page, to_page(self.rotation, p, bounds.size()))))
+            }
+            // Every page hears the release, wherever it happens.
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if self.selecting => {
+                Some(Action::publish(Message::SelectEnd))
+            }
+            _ => None,
+        }
     }
 
-    fn draw(&self, _: &(), _: &Renderer, _: &Theme, _: Rectangle, _: Cursor) -> Vec<Geometry> {
-        Vec::new()
+    fn draw(&self, _: &Self::State, renderer: &Renderer, _: &Theme, bounds: Rectangle, _: Cursor) -> Vec<Geometry> {
+        if self.selected.is_empty() && self.found.is_empty() {
+            return Vec::new();
+        }
+        let mut frame = Frame::new(renderer, bounds.size());
+        let size = bounds.size();
+        let layers = [(&self.found, FOUND), (&self.current, CURRENT), (&self.selected, SELECTED)];
+        for (boxes, color) in layers {
+            for &area in boxes {
+                let [left, top, right, bottom] = turned_box(self.rotation, area);
+                let at = Point::new(left * size.width, top * size.height);
+                let extent = Size::new((right - left) * size.width, (bottom - top) * size.height);
+                frame.fill_rectangle(at, extent, color);
+            }
+        }
+        vec![frame.into_geometry()]
     }
 
-    fn mouse_interaction(&self, _: &(), bounds: Rectangle, cursor: Cursor) -> mouse::Interaction {
-        if self.under(bounds, cursor).is_some() { mouse::Interaction::Pointer } else { mouse::Interaction::default() }
+    fn mouse_interaction(&self, _: &Self::State, bounds: Rectangle, cursor: Cursor) -> mouse::Interaction {
+        if self.under(bounds, cursor).is_some() {
+            mouse::Interaction::Pointer
+        } else if self.selecting || self.over_text(bounds, cursor) {
+            mouse::Interaction::Text
+        } else {
+            mouse::Interaction::default()
+        }
     }
 }
 

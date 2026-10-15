@@ -65,6 +65,107 @@ impl Detail {
 /// A rendered page and its links.
 pub type Rendered = (image::Handle, Vec<Link>);
 
+/// A page's text, for selecting and copying: its characters in reading order
+/// and its lines. Boxes are left, top, right, bottom as fractions of the page.
+#[derive(Debug, Clone, Default)]
+pub struct PageText {
+    pub chars: Vec<char>,
+    pub boxes: Vec<[f32; 4]>,
+    /// Where each line's characters start and end in `chars`, and its box.
+    pub lines: Vec<(usize, usize, [f32; 4])>,
+}
+
+/// One match of a search: its page and boxes (a match can go on over a line
+/// break).
+#[derive(Debug, Clone)]
+pub struct Hit {
+    pub page: usize,
+    pub areas: Vec<[f32; 4]>,
+}
+
+impl PageText {
+    /// Where a point falls between the characters, like a text cursor: on the
+    /// line under it (or else the nearest line), before the first character
+    /// whose middle is right of it. Past the last character is `chars.len()`
+    /// for the last line, or the next line's start.
+    pub fn caret(&self, (x, y): (f32, f32)) -> usize {
+        let away = |[left, top, right, bottom]: [f32; 4]| {
+            ((top - y).max(y - bottom).max(0.0), (left - x).max(x - right).max(0.0))
+        };
+        let nearest = self.lines.iter().min_by(|a, b| {
+            let ((ay, ax), (by, bx)) = (away(a.2), away(b.2));
+            ay.total_cmp(&by).then(ax.total_cmp(&bx))
+        });
+        let Some(&(start, end, _)) = nearest else { return 0 };
+        (start..end)
+            .find(|&i| {
+                let [left, _, right, _] = self.boxes[i];
+                (left + right) / 2.0 > x
+            })
+            .unwrap_or(end)
+    }
+
+    /// The word around a caret, for a double click.
+    pub fn word(&self, caret: usize) -> (usize, usize) {
+        let (line_start, line_end) = self.line(caret);
+        let in_word = |i: usize| self.chars[i].is_alphanumeric();
+        let mut start = caret.min(line_end.saturating_sub(1)).max(line_start);
+        if start >= line_end || !in_word(start) {
+            return (start, (start + 1).min(line_end));
+        }
+        let mut end = start;
+        while start > line_start && in_word(start - 1) {
+            start -= 1;
+        }
+        while end < line_end && in_word(end) {
+            end += 1;
+        }
+        (start, end)
+    }
+
+    /// The line a caret is on, for a triple click.
+    pub fn line(&self, caret: usize) -> (usize, usize) {
+        self.lines
+            .iter()
+            .find(|(start, end, _)| (*start..*end).contains(&caret))
+            .or(self.lines.last())
+            .map_or((0, 0), |&(start, end, _)| (start, end))
+    }
+
+    /// Boxes covering the characters from `from` to `to`, one per line.
+    pub fn areas(&self, from: usize, to: usize) -> Vec<[f32; 4]> {
+        self.lines
+            .iter()
+            .filter_map(|&(start, end, _)| {
+                let (a, b) = (start.max(from), end.min(to));
+                (a < b).then(|| union(&self.boxes[a..b]))
+            })
+            .collect()
+    }
+
+    /// The characters from `from` to `to`, with a line break between lines.
+    fn text(&self, from: usize, to: usize) -> String {
+        let mut text = String::new();
+        for (index, &(start, end, _)) in self.lines.iter().enumerate() {
+            let (a, b) = (start.max(from), end.min(to));
+            if a < b {
+                if index > 0 && a == start && !text.is_empty() {
+                    text.push('\n');
+                }
+                text.extend(&self.chars[a..b]);
+            }
+        }
+        text
+    }
+}
+
+/// The box around some boxes.
+fn union(boxes: &[[f32; 4]]) -> [f32; 4] {
+    boxes.iter().fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |[l, t, r, b], [bl, bt, br, bb]| {
+        [l.min(*bl), t.min(*bt), r.max(*br), b.max(*bb)]
+    })
+}
+
 /// Why a file didn't open.
 #[derive(Debug, Clone)]
 pub enum OpenError {
@@ -101,6 +202,9 @@ enum Request {
     #[cfg(not(windows))]
     Export(Vec<(usize, Stroke)>, oneshot::Sender<Result<Vec<u8>, String>>),
     Scan(std::ops::Range<usize>, oneshot::Sender<Vec<Heading>>),
+    Text(usize, oneshot::Sender<Option<PageText>>),
+    Find(String, std::ops::Range<usize>, oneshot::Sender<Vec<Hit>>),
+    Copy((usize, usize), (usize, usize), oneshot::Sender<String>),
     #[cfg(windows)]
     Print(Vec<(usize, Stroke)>, crate::print::Job, oneshot::Sender<Result<(), String>>),
 }
@@ -154,6 +258,27 @@ impl Worker {
         let (reply, rx) = oneshot::channel();
         let _ = self.tx.send(Request::Render(page, bitmap, reply));
         rx.await.ok().flatten()
+    }
+
+    /// A page's text, for selecting, if the page is still near the view.
+    pub async fn text(self, page: usize) -> Option<PageText> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(Request::Text(page, reply));
+        rx.await.ok().flatten()
+    }
+
+    /// Where `needle` is on some pages, ignoring case.
+    pub async fn find(self, needle: String, pages: std::ops::Range<usize>) -> Vec<Hit> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(Request::Find(needle, pages, reply));
+        rx.await.unwrap_or_default()
+    }
+
+    /// The text between two places, each a page and a caret on it.
+    pub async fn copy(self, from: (usize, usize), to: (usize, usize)) -> String {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(Request::Copy(from, to, reply));
+        rx.await.unwrap_or_default()
     }
 
     /// Numbered headings on some pages of the open document.
@@ -216,6 +341,28 @@ fn run(mut rx: mpsc::UnboundedReceiver<Request>, (wanted, wanted_details): (Want
                     .filter(|_| still_wanted)
                     .and_then(|(_, _, doc)| render_detail(doc, index, detail));
                 let _ = reply.send(image);
+            }
+            Request::Text(index, reply) => {
+                let still_wanted = wanted.lock().unwrap().contains_key(&index);
+                let text = open
+                    .as_ref()
+                    .filter(|_| still_wanted)
+                    .and_then(|(_, _, doc)| page_text(&doc.load_page(index as i32).ok()?));
+                let _ = reply.send(text);
+            }
+            Request::Find(needle, pages, reply) => {
+                let hits = match &open {
+                    Some((_, _, doc)) => pages.filter_map(|index| find(doc, index, &needle)).flatten().collect(),
+                    None => Vec::new(),
+                };
+                let _ = reply.send(hits);
+            }
+            Request::Copy(from, to, reply) => {
+                let text = match &open {
+                    Some((_, _, doc)) => copy(doc, from, to),
+                    None => String::new(),
+                };
+                let _ = reply.send(text);
             }
             Request::Scan(pages, reply) => {
                 if pages.start == 0 {
@@ -306,6 +453,82 @@ fn collect_outline(items: &[mupdf::Outline], depth: usize, out: &mut Vec<Outline
         });
         collect_outline(&item.down, depth + 1, out);
     }
+}
+
+/// A page's text in reading order, with boxes as fractions of the page.
+fn page_text(page: &Page) -> Option<PageText> {
+    let bounds = page.bounds().ok()?;
+    let text = page.to_text_page(TextPageFlags::empty()).ok()?;
+    let fraction = |rect: Rect| fractions(bounds, rect);
+    let mut out = PageText::default();
+    for block in text.blocks() {
+        for line in block.lines() {
+            let start = out.chars.len();
+            for ch in line.chars() {
+                let Some(c) = ch.char() else { continue };
+                out.chars.push(c);
+                out.boxes.push(fraction(quad_bounds(ch.quad())));
+            }
+            if out.chars.len() > start {
+                let area = union(&out.boxes[start..]);
+                out.lines.push((start, out.chars.len(), area));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The matches of `needle` on a page.
+fn find(doc: &Document, index: usize, needle: &str) -> Option<Vec<Hit>> {
+    let page = doc.load_page(index as i32).ok()?;
+    let bounds = page.bounds().ok()?;
+    let text = page.to_text_page(TextPageFlags::empty()).ok()?;
+    let mut hits: Vec<Hit> = Vec::new();
+    text.search_cb(needle, &mut hits, |hits, quads| {
+        let areas = quads.iter().map(|quad| fractions(bounds, quad_bounds(quad.clone()))).collect();
+        hits.push(Hit { page: index, areas });
+        mupdf::text_page::SearchHitResponse::ContinueSearch
+    })
+    .ok()?;
+    Some(hits)
+}
+
+/// The text from one place to another, each a page and a caret on it, with a
+/// line break between lines and between pages.
+fn copy(doc: &Document, (from_page, from): (usize, usize), (to_page, to): (usize, usize)) -> String {
+    let mut text = String::new();
+    for index in from_page..=to_page {
+        let Some(page) = doc.load_page(index as i32).ok().and_then(|page| page_text(&page)) else { continue };
+        let start = if index == from_page { from } else { 0 };
+        let end = if index == to_page { to } else { page.chars.len() };
+        let part = page.text(start, end.min(page.chars.len()));
+        if !part.is_empty() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&part);
+        }
+    }
+    text
+}
+
+/// The box around a quad.
+fn quad_bounds(quad: mupdf::Quad) -> Rect {
+    let xs = [quad.ul.x, quad.ur.x, quad.ll.x, quad.lr.x];
+    let ys = [quad.ul.y, quad.ur.y, quad.ll.y, quad.lr.y];
+    let (min, max) = (|v: [f32; 4]| v.into_iter().fold(f32::MAX, f32::min), |v: [f32; 4]| v.into_iter().fold(f32::MIN, f32::max));
+    Rect::new(min(xs), min(ys), max(xs), max(ys))
+}
+
+/// A rectangle on a page as fractions of it: left, top, right, bottom.
+fn fractions(bounds: Rect, rect: Rect) -> [f32; 4] {
+    let (width, height) = (bounds.x1 - bounds.x0, bounds.y1 - bounds.y0);
+    [
+        (rect.x0 - bounds.x0) / width,
+        (rect.y0 - bounds.y0) / height,
+        (rect.x1 - bounds.x0) / width,
+        (rect.y1 - bounds.y0) / height,
+    ]
 }
 
 /// A character of a line, for finding headings.
@@ -561,17 +784,10 @@ fn ink(device: &Device, bounds: Rect, strokes: &[&Stroke], ctm: &Matrix) -> Resu
 }
 
 fn links(doc: &Document, page: &Page, bounds: Rect) -> Vec<Link> {
-    let (width, height) = (bounds.x1 - bounds.x0, bounds.y1 - bounds.y0);
     let Ok(links) = page.links() else { return Vec::new() };
     links
         .filter_map(|link| {
-            let rect = link.bounds;
-            let area = [
-                (rect.x0 - bounds.x0) / width,
-                (rect.y0 - bounds.y0) / height,
-                (rect.x1 - bounds.x0) / width,
-                (rect.y1 - bounds.y0) / height,
-            ];
+            let area = fractions(bounds, link.bounds);
             let target = match link.dest {
                 Some(dest) => target(doc, dest),
                 None if link.uri.contains("://") || link.uri.starts_with("mailto:") => Target::Web(link.uri),

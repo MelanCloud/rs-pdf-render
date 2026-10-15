@@ -1,8 +1,8 @@
-use crate::ink::{Ink, Links, Wheel};
+use crate::ink::{Ink, Overlay, Wheel};
 use crate::settings::{SCROLL_SPEEDS, ThemeChoice, Zoom};
 use crate::{
-    App, DOCUMENT, Document, GAP, Locked, Menu, Message, PASSWORD, PT_TO_PX, SCROLLBAR_WIDTH, SIDEBAR_WIDTH,
-    TOOLBAR_HEIGHT,
+    App, DOCUMENT, Document, FIND, Find, GAP, Locked, Menu, Message, PASSWORD, PT_TO_PX, SCROLLBAR_WIDTH,
+    SIDEBAR_WIDTH, TOOLBAR_HEIGHT,
 };
 
 use iced::widget::scrollable::{Direction, Scrollbar};
@@ -96,6 +96,15 @@ pub fn view(app: &App) -> Element<'_, Message> {
     // Under the toolbar, so another file can still be opened or the window closed.
     if let Some(locked) = &app.locked {
         layers = layers.push(password(locked));
+    }
+    // Under the toolbar's right end, like the dropdowns (it's opened from ☰).
+    if let Some(find) = app.doc.as_ref().and_then(|doc| doc.find.as_ref()) {
+        layers = layers.push(
+            container(opaque(find_bar(find)))
+                .width(Fill)
+                .align_x(iced::Right)
+                .padding(iced::Padding::new(6.0).top(reveal + 6.0)),
+        );
     }
     if let Some(menu) = app.menu {
         let dropdown = match menu {
@@ -439,9 +448,29 @@ fn page<'a>(app: &'a App, doc: &'a Document, index: usize) -> Element<'a, Messag
         };
         layers = layers.push(canvas(ink).width(Fill).height(Fill));
     }
-    if !app.drawing && !page.links.is_empty() {
-        let links = Links { links: &page.links, rotation: doc.rotation };
-        layers = layers.push(canvas(links).width(Fill).height(Fill));
+    if !app.drawing {
+        let selected = match (&page.text, doc.selection.and_then(|selection| selection.on(index))) {
+            (Some(text), Some((from, to))) => text.areas(from, to),
+            _ => Vec::new(),
+        };
+        let (mut found, mut current) = (Vec::new(), Vec::new());
+        if let Some(find) = &doc.find {
+            let start = find.hits.partition_point(|hit| hit.page < index);
+            for (at, hit) in find.hits.iter().enumerate().skip(start).take_while(|(_, hit)| hit.page == index) {
+                if find.current == Some(at) { &mut current } else { &mut found }.extend(&hit.areas);
+            }
+        }
+        let overlay = Overlay {
+            page: index,
+            links: &page.links,
+            text: page.text.as_ref(),
+            rotation: doc.rotation,
+            selecting: doc.selecting,
+            selected,
+            found,
+            current,
+        };
+        layers = layers.push(canvas(overlay).width(Fill).height(Fill));
     }
 
     container(layers)
@@ -566,6 +595,34 @@ fn password(locked: &Locked) -> Element<'_, Message> {
     }))
 }
 
+/// pdf.js's find bar: the search box, previous and next, and how it's going.
+fn find_bar(find: &Find) -> Element<'_, Message> {
+    let input = text_input("Find in document…", &find.query)
+        .id(FIND)
+        .on_input(Message::FindInput)
+        .on_submit(Message::FindSubmit)
+        .width(200)
+        .size(13)
+        .padding([4, 8])
+        .style(field_style);
+    let status = match find.current {
+        _ if find.query.trim().is_empty() => String::new(),
+        Some(at) => format!("{} of {}", at + 1, find.hits.len()),
+        None if find.running() => "Searching…".into(),
+        None => "Not found".into(),
+    };
+    let has_hits = !find.hits.is_empty();
+    let bar = row![
+        input,
+        tool(icon::PREVIOUS, has_hits.then_some(Message::FindPrevious), false, "Previous (Shift+Enter)"),
+        tool(icon::NEXT, has_hits.then_some(Message::FindNext), false, "Next (Enter)"),
+        text(status).size(12).style(muted).wrapping(text::Wrapping::None),
+    ]
+    .spacing(4)
+    .align_y(Center);
+    container(bar).padding(6).style(toast).into()
+}
+
 /// The settings menu under the gear button.
 fn settings(app: &App) -> Element<'_, Message> {
     let themes = row(ThemeChoice::ALL.map(|choice| {
@@ -631,6 +688,7 @@ fn file_menu(app: &App) -> Element<'_, Message> {
     };
     let menu = column![
         item(icon::OPEN, "Open file…", shortcut!("O"), app.pdf.is_ok().then_some(Message::PickFile)),
+        item(icon::SEARCH, "Find…", shortcut!("F"), app.doc.is_some().then_some(Message::OpenFind)),
         item(icon::PRINT, "Print…", shortcut!("P"), app.doc.is_some().then_some(Message::Print)),
     ]
     .spacing(2);
@@ -826,6 +884,9 @@ mod icon {
     icon!(PRINT, r#"<path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><path d="M6 9V3a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v6"/><rect x="6" y="14" width="12" height="8" rx="1"/>"#);
     icon!(OPEN, r#"<path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/>"#);
     icon!(EXPAND, r#"<path d="m9 18 6-6-6-6"/>"#);
+    icon!(SEARCH, r#"<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>"#);
+    icon!(PREVIOUS, r#"<path d="m18 15-6-6-6 6"/>"#);
+    icon!(NEXT, r#"<path d="m6 9 6 6 6-6"/>"#);
     icon!(COLLAPSE, r#"<path d="m6 9 6 6 6-6"/>"#);
     icon!(MINIMIZE, r#"<path d="M5 12h14"/>"#);
     icon!(MAXIMIZE, r#"<rect width="16" height="16" x="4" y="4" rx="2"/>"#);

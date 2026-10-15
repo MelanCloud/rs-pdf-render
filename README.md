@@ -65,6 +65,12 @@ there are no ready-made packages for them yet.
   corner, like Acrobat. Text stays sharp even at 1000%.
 - **Pages:** type a page number next to the page count, or rotate
   counterclockwise.
+- **Search:** Find in the ☰ menu or Ctrl+F opens a find bar that searches the
+  whole document as you type, ignoring case. All matches are highlighted,
+  with "3 of 41" to step through them.
+- **Select and copy:** drag across text to select it, even across pages;
+  double-click selects a word and triple-click a line. Ctrl+A selects all
+  and Ctrl+C copies.
 - **Outline:** the document's table of contents in a sidebar. Optionally,
   the app scans the text for numbered subsections like "2.6.4" and adds them,
   for books whose own outline stops at the sections.
@@ -90,6 +96,9 @@ On macOS, use ⌘ instead of Ctrl.
 | --- | --- |
 | Ctrl+O | Open a PDF (or drop one on the window) |
 | Ctrl+P | Print |
+| Ctrl+F | Find in the document |
+| Enter / Shift+Enter, F3 / Shift+F3 | Next / previous match |
+| Ctrl+A / Ctrl+C | Select all text / copy the selection |
 | Ctrl++ / Ctrl+- | Zoom in / out |
 | Ctrl+0 | Back to the default zoom |
 | Ctrl + mouse wheel | Zoom around the pointer |
@@ -98,7 +107,7 @@ On macOS, use ⌘ instead of Ctrl.
 | Up / Down | Scroll a little |
 | Alt+Left / Alt+Right | Back / Forward (also the mouse's side buttons; ⌘[ and ⌘] on macOS) |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo the last drawing |
-| Esc | Close a menu or the password box, or stop drawing |
+| Esc | Close a menu, the password box or the find bar, or stop drawing |
 | Enter | Apply what you typed in the page, zoom or password box |
 
 Drag the top or bottom bar to move the window, and double-click it to

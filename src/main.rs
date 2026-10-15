@@ -9,7 +9,7 @@ mod system;
 mod ui;
 
 use ink::Stroke;
-use pdf::{Bitmap, Detail, Heading, Link, OpenError, OutlineEntry, Target, Worker};
+use pdf::{Bitmap, Detail, Heading, Hit, Link, OpenError, OutlineEntry, PageText, Target, Worker};
 use settings::{Position, Settings, ThemeChoice, Zoom};
 
 use iced::time::Instant;
@@ -37,6 +37,8 @@ const REVEAL_DISTANCE: f32 = 12.0;
 const HIDE_DISTANCE: f32 = 40.0;
 /// Pages scanned for headings per request, so page renders can go in between.
 const SCAN_BATCH: usize = 8;
+/// Pages searched per request, for the same reason.
+const FIND_BATCH: usize = 16;
 /// How long the zoom indicator stays after the zoom changes, then how long
 /// it takes to fade.
 const ZOOM_SHOWN: Duration = Duration::from_millis(1200);
@@ -45,6 +47,7 @@ const ZOOM_FADE: Duration = Duration::from_millis(250);
 const GLIDE: Duration = Duration::from_millis(160);
 const DOCUMENT: &str = "document";
 const PASSWORD: &str = "password";
+const FIND: &str = "find";
 
 fn main() -> iced::Result {
     // On Windows, wgpu picks Vulkan by itself; DirectX 12 used about 70 MB
@@ -165,6 +168,62 @@ pub struct Document {
     /// and where Back left from, for Forward.
     back: Vec<Spot>,
     forward: Vec<Spot>,
+    /// Selected text, and whether the mouse is still dragging it out.
+    selection: Option<Selection>,
+    selecting: bool,
+    /// The find bar, while open.
+    find: Option<Find>,
+}
+
+/// A place in a page's text: the page, and a caret on it (before the
+/// character with that index; past the last one means the page's end).
+type Caret = (usize, usize);
+
+/// Selected text: from where the drag started to where it is now, in either
+/// order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Selection {
+    anchor: Caret,
+    focus: Caret,
+}
+
+impl Selection {
+    /// The selection's start and end, in reading order.
+    fn ordered(&self) -> (Caret, Caret) {
+        if self.anchor <= self.focus { (self.anchor, self.focus) } else { (self.focus, self.anchor) }
+    }
+
+    /// What's selected on a page: from where to where in its text.
+    pub fn on(&self, page: usize) -> Option<(usize, usize)> {
+        let ((from_page, from), (to_page, to)) = self.ordered();
+        let from = if page == from_page { from } else { 0 };
+        let to = if page == to_page { to } else { usize::MAX };
+        (from_page..=to_page).contains(&page).then_some((from, to))
+    }
+}
+
+/// The find bar and its search. The search runs through the whole document
+/// in batches, from the page in view on and then wrapping around, like pdf.js.
+pub struct Find {
+    query: String,
+    /// Which search the results belong to; typing starts a new one.
+    search: u64,
+    /// The page the search started from.
+    from: usize,
+    /// How many pages have been searched, of how many.
+    searched: usize,
+    pages: usize,
+    /// Matches in page order.
+    hits: Vec<Hit>,
+    /// The match the find bar is on.
+    current: Option<usize>,
+}
+
+impl Find {
+    /// Whether the search is still going through pages.
+    pub fn running(&self) -> bool {
+        self.searched < self.pages
+    }
 }
 
 /// How far a scan for numbered headings has got.
@@ -194,6 +253,9 @@ pub struct Page {
     strokes: Vec<Stroke>,
     /// Kept when the bitmap is dropped; they're small.
     links: Vec<Link>,
+    /// The page's text, for selecting, while the page is near the view.
+    text: Option<PageText>,
+    text_pending: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +283,7 @@ pub enum Message {
     /// Escape, even when a text box takes it.
     Escape,
     Rendered { doc: u64, page: usize, bitmap: Bitmap, rendered: Option<pdf::Rendered> },
+    TextLoaded { doc: u64, page: usize, text: Option<PageText> },
     DetailRendered { doc: u64, page: usize, detail: Detail, image: Option<image::Handle> },
 
     Scrolled(scrollable::Viewport),
@@ -243,6 +306,22 @@ pub enum Message {
     RotateCounterclockwise,
     ToggleSidebar,
     ToggleOutlineEntry(usize),
+
+    /// A press on a page, as fractions of it, and how many clicks in a row.
+    SelectStart(usize, (f32, f32), u8),
+    SelectTo(usize, (f32, f32)),
+    SelectEnd,
+    SelectAll,
+    Copy,
+    /// Find in ☰ or Ctrl+F: open the find bar, or go back to its box.
+    OpenFind,
+    FindInput(String),
+    /// Enter in the find box: the next match, or the previous with Shift.
+    FindSubmit,
+    FindNext,
+    FindPrevious,
+    /// Matches on some pages, for a document and search.
+    Found { doc: u64, search: u64, pages: std::ops::Range<usize>, hits: Vec<Hit> },
 
     ToggleDrawing,
     PenColor(Color),
@@ -498,7 +577,11 @@ impl App {
             Message::Escape => {
                 if self.menu.is_some() {
                     self.menu = None;
-                } else if self.locked.take().is_none() {
+                } else if self.locked.is_some() {
+                    self.locked = None;
+                } else if self.doc.as_mut().is_some_and(|doc| doc.find.take().is_some()) {
+                    self.show_toolbar(false);
+                } else {
                     self.drawing = false;
                 }
             }
@@ -518,6 +601,14 @@ impl App {
                 }
             }
 
+            Message::TextLoaded { doc, page, text } => {
+                if let Some(page) = self.doc.as_mut().filter(|d| d.id == doc).and_then(|d| d.pages.get_mut(page))
+                    && page.text_pending
+                {
+                    page.text_pending = false;
+                    page.text = text;
+                }
+            }
             Message::DetailRendered { doc, page, detail, image } => {
                 if let Some(page) = self
                     .doc
@@ -628,6 +719,127 @@ impl App {
                 {
                     doc.collapsed.insert(entry);
                 }
+            }
+
+            Message::SelectStart(page, at, clicks) => {
+                let Some(doc) = &mut self.doc else { return Task::none() };
+                let Some(text) = &doc.pages[page].text else {
+                    doc.selection = None;
+                    return Task::none();
+                };
+                // Like a browser: one click places the start, two pick a word,
+                // three a line.
+                let caret = text.caret(at);
+                let (from, to) = match clicks {
+                    2 => text.word(caret),
+                    3 => text.line(caret),
+                    _ => (caret, caret),
+                };
+                doc.selection = Some(Selection { anchor: (page, from), focus: (page, to) });
+                doc.selecting = true;
+            }
+            Message::SelectTo(page, at) => {
+                if let Some(doc) = &mut self.doc
+                    && doc.selecting
+                    && let (Some(selection), Some(text)) = (&mut doc.selection, &doc.pages[page].text)
+                {
+                    selection.focus = (page, text.caret(at));
+                }
+            }
+            Message::SelectEnd => {
+                if let Some(doc) = &mut self.doc {
+                    doc.selecting = false;
+                    if doc.selection.is_some_and(|selection| selection.anchor == selection.focus) {
+                        doc.selection = None;
+                    }
+                }
+            }
+            Message::SelectAll => {
+                if let Some(doc) = &mut self.doc {
+                    let last = doc.pages.len() - 1;
+                    doc.selection = Some(Selection { anchor: (0, 0), focus: (last, usize::MAX) });
+                }
+            }
+            Message::Copy => {
+                let (Some(doc), Ok(worker)) = (&self.doc, &self.pdf) else { return Task::none() };
+                let Some(selection) = doc.selection else { return Task::none() };
+                let (from, to) = selection.ordered();
+                return Task::perform(worker.clone().copy(from, to), std::convert::identity)
+                    .then(|text| if text.is_empty() { Task::none() } else { iced::clipboard::write(text) });
+            }
+
+            Message::OpenFind => {
+                let Some(doc) = &mut self.doc else { return Task::none() };
+                if doc.find.is_none() {
+                    let pages = doc.pages.len();
+                    doc.find = Some(Find {
+                        query: String::new(),
+                        search: 0,
+                        from: doc.current,
+                        searched: pages,
+                        pages,
+                        hits: Vec::new(),
+                        current: None,
+                    });
+                }
+                self.menu = None;
+                self.show_toolbar(true);
+                return Task::batch([operation::focus(FIND), operation::select_all(FIND)]);
+            }
+            Message::FindInput(query) => {
+                let Some(doc) = &mut self.doc else { return Task::none() };
+                let Some(find) = &mut doc.find else { return Task::none() };
+                // A new search, from the page in view; what an older one
+                // still finds is ignored.
+                find.search += 1;
+                find.from = doc.current;
+                find.searched = if query.trim().is_empty() { doc.pages.len() } else { 0 };
+                find.hits.clear();
+                find.current = None;
+                find.query = query;
+                return self.find_next_batch();
+            }
+            Message::FindSubmit => {
+                let message = if self.modifiers.shift() { Message::FindPrevious } else { Message::FindNext };
+                return self.update(message);
+            }
+            Message::FindNext | Message::FindPrevious => {
+                let forward = matches!(message, Message::FindNext);
+                let Some(doc) = &mut self.doc else { return Task::none() };
+                let Some(find) = &mut doc.find else { return Task::none() };
+                let count = find.hits.len();
+                if count == 0 {
+                    return Task::none();
+                }
+                find.current = Some(match find.current {
+                    Some(at) if forward => (at + 1) % count,
+                    Some(at) => (at + count - 1) % count,
+                    None => 0,
+                });
+                return self.show_hit();
+            }
+            Message::Found { doc, search, pages, hits } => {
+                let Some(open) = self.doc.as_mut().filter(|d| d.id == doc) else { return Task::none() };
+                let Some(find) = open.find.as_mut().filter(|find| find.search == search) else { return Task::none() };
+                find.searched += pages.len();
+                // The first match found (from the page in view on) is the one
+                // to show. The list stays in page order.
+                let mut show = false;
+                if let Some(first) = hits.first() {
+                    let at = find.hits.partition_point(|hit| hit.page < first.page);
+                    let count = hits.len();
+                    find.hits.splice(at..at, hits);
+                    match &mut find.current {
+                        Some(current) if *current >= at => *current += count,
+                        Some(_) => {}
+                        None => {
+                            find.current = Some(at);
+                            show = true;
+                        }
+                    }
+                }
+                let next = self.find_next_batch();
+                return if show { Task::batch([next, self.show_hit()]) } else { next };
             }
 
             Message::ToggleDrawing => self.drawing = !self.drawing && self.doc.is_some(),
@@ -784,6 +996,15 @@ impl App {
                 return self.update(Message::Redo);
             }
             Key::Character("z" | "Z") if modifiers.command() => return self.update(Message::Undo),
+            Key::Character("f") if modifiers.command() => return self.update(Message::OpenFind),
+            Key::Character("g" | "G") if modifiers.command() && modifiers.shift() => {
+                return self.update(Message::FindPrevious);
+            }
+            Key::Character("g") if modifiers.command() => return self.update(Message::FindNext),
+            Key::Named(Named::F3) if modifiers.shift() => return self.update(Message::FindPrevious),
+            Key::Named(Named::F3) => return self.update(Message::FindNext),
+            Key::Character("a") if modifiers.command() => return self.update(Message::SelectAll),
+            Key::Character("c") if modifiers.command() => return self.update(Message::Copy),
             Key::Named(Named::Home) => return self.go_to(0),
             Key::Named(Named::End) => {
                 let last = self.doc.as_ref().map_or(0, |doc| doc.pages.len() - 1);
@@ -807,7 +1028,8 @@ impl App {
     }
 
     fn show_toolbar(&mut self, show: bool) {
-        let show = show || self.doc.is_none() || self.menu.is_some() || self.settings.always_show_toolbars;
+        let finding = self.doc.as_ref().is_some_and(|doc| doc.find.is_some());
+        let show = show || self.doc.is_none() || self.menu.is_some() || finding || self.settings.always_show_toolbars;
         if show == self.toolbar.value() {
             return;
         }
@@ -850,6 +1072,8 @@ impl App {
                     pending_detail: None,
                     strokes: Vec::new(),
                     links: Vec::new(),
+                    text: None,
+                    text_pending: false,
                 })
                 .collect(),
             file_outline: info.outline.clone(),
@@ -868,6 +1092,9 @@ impl App {
             glide: None,
             back: Vec::new(),
             forward: Vec::new(),
+            selection: None,
+            selecting: false,
+            find: None,
         });
         // Like pdf.js, reopen where the file was left, or else use the default zoom.
         if let Some(mode) = self.doc.as_ref().and_then(|doc| doc.fit) {
@@ -900,6 +1127,53 @@ impl App {
         let end = (scan.next + SCAN_BATCH).min(doc.pages.len());
         let id = doc.id;
         Task::perform(worker.clone().scan(scan.next..end), move |found| Message::Scanned(id, end, found))
+    }
+
+    /// Searches the next pages for what's in the find box: from the page the
+    /// search started on to the end, then from the start up to it.
+    fn find_next_batch(&self) -> Task<Message> {
+        let (Some(doc), Ok(worker)) = (&self.doc, &self.pdf) else { return Task::none() };
+        let Some(find) = &doc.find else { return Task::none() };
+        let count = doc.pages.len();
+        if find.searched >= count {
+            return Task::none();
+        }
+        let start = (find.from + find.searched) % count;
+        let limit = if start >= find.from { count } else { find.from };
+        let pages = start..(start + FIND_BATCH).min(limit);
+        let (id, search) = (doc.id, find.search);
+        Task::perform(worker.clone().find(find.query.clone(), pages.clone()), move |hits| {
+            Message::Found { doc: id, search, pages: pages.clone(), hits }
+        })
+    }
+
+    /// Scrolls the match the find bar is on into view, a third of the way
+    /// down, unless it already shows.
+    fn show_hit(&mut self) -> Task<Message> {
+        let view = self.viewport();
+        let Some(doc) = &mut self.doc else { return Task::none() };
+        let Some(hit) = doc.find.as_ref().and_then(|find| find.hits.get(find.current?)) else { return Task::none() };
+        let area = hit.areas.iter().fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |[l, t, r, b], [hl, ht, hr, hb]| {
+            [l.min(*hl), t.min(*ht), r.max(*hr), b.max(*hb)]
+        });
+        let [left, top, right, bottom] = ink::turned_box(doc.rotation, area);
+        let size = doc.page_size(hit.page);
+        let (page_left, page_top) = ((doc.content_size(view).width - size.width) / 2.0, doc.tops()[hit.page]);
+        let (x0, x1) = (page_left + left * size.width, page_left + right * size.width);
+        let (y0, y1) = (page_top + top * size.height, page_top + bottom * size.height);
+        // The toolbars cover the view's top and bottom while the find bar is open.
+        let mut offset = doc.offset;
+        if y0 < offset.y + TOOLBAR_HEIGHT || y1 > offset.y + view.height - TOOLBAR_HEIGHT {
+            offset.y = y0 - view.height / 3.0;
+        }
+        if x0 < offset.x || x1 > offset.x + view.width {
+            offset.x = (x0 + x1 - view.width) / 2.0;
+        }
+        if offset == doc.offset {
+            return Task::none();
+        }
+        doc.glide = None;
+        self.scroll_to(offset)
     }
 
     /// Saves where the open file was left, for next time.
@@ -1084,7 +1358,18 @@ impl App {
                 page.pending = None;
                 page.detail = None;
                 page.pending_detail = None;
+                page.text = None;
+                page.text_pending = false;
                 continue;
+            }
+            if page.text.is_none() && !page.text_pending {
+                page.text_pending = true;
+                let id = doc.id;
+                tasks.push(Task::perform(worker.clone().text(index), move |text| Message::TextLoaded {
+                    doc: id,
+                    page: index,
+                    text,
+                }));
             }
 
             let full_width = page.size.width * doc.zoom * PT_TO_PX * scale_factor;
