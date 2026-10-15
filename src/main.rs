@@ -396,7 +396,11 @@ impl App {
             Message::WindowReady(id, scale) => {
                 self.window = Some(id);
                 self.scale_factor = scale;
-                return window::size(id).map(Message::FirstSize);
+                let size = window::size(id).map(Message::FirstSize);
+                #[cfg(windows)]
+                return Task::batch([size, window::run(id, system::fit_drawing_area).discard()]);
+                #[cfg(not(windows))]
+                return size;
             }
             // The size asked for at startup can arrive after a newer resize
             // (tiling window managers resize new windows at once), so it only

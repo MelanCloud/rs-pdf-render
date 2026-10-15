@@ -391,6 +391,11 @@ fn page<'a>(app: &'a App, doc: &'a Document, index: usize) -> Element<'a, Messag
     let size = doc.page_size(index);
     let mut layers = stack![].width(size.width).height(size.height);
 
+    // The sharp part in view, when zoomed in too far to render the page whole.
+    let detail = page.detail.as_ref().filter(|(detail, _)| {
+        doc.rotation == 0 && (detail.page_width as f32 - size.width * app.scale_factor).abs() < 1.0
+    });
+
     if let Some((bitmap, handle)) = &page.image {
         let turn = Rotation::Solid(Radians(f32::from(doc.rotation).to_radians()));
         // Shown at exactly its rendered size (nearly always), the bitmap is
@@ -398,7 +403,10 @@ fn page<'a>(app: &'a App, doc: &'a Document, index: usize) -> Element<'a, Messag
         // sits between pixel rows, which smooth scrolling and exact jumps
         // cause. Stretched (mid-zoom, or past the size cap) it blends.
         let exact = (bitmap.width as f32 - page.size.width * doc.zoom * PT_TO_PX * app.scale_factor).abs() < 1.0;
-        let picture = image(handle.clone()).rotation(turn);
+        // Under a sharp part it's copied pixel by pixel too: iced draws
+        // blended images after pixel-for-pixel ones, so it would cover it.
+        let filter = if exact || detail.is_some() { image::FilterMethod::Nearest } else { image::FilterMethod::Linear };
+        let picture = image(handle.clone()).rotation(turn).filter_method(filter);
         layers = layers.push(match handle {
             // Laid out at the bitmap's whole-pixel size, not the page's
             // fractional one: iced rounds each edge to the pixel grid, so a
@@ -407,16 +415,12 @@ fn page<'a>(app: &'a App, doc: &'a Document, index: usize) -> Element<'a, Messag
             image::Handle::Rgba { width, height, .. } if exact => {
                 let (w, h) = (*width as f32 / app.scale_factor, *height as f32 / app.scale_factor);
                 let (w, h) = if doc.rotation.is_multiple_of(180) { (w, h) } else { (h, w) };
-                picture.width(w).height(h).filter_method(image::FilterMethod::Nearest)
+                picture.width(w).height(h)
             }
-            _ => picture.width(Fill).height(Fill).filter_method(image::FilterMethod::Linear),
+            _ => picture.width(Fill).height(Fill),
         });
     }
-    // The sharp part in view, when zoomed in too far to render the page whole.
-    if let Some((detail, handle)) = &page.detail
-        && doc.rotation == 0
-        && (detail.page_width as f32 - size.width * app.scale_factor).abs() < 1.0
-    {
+    if let Some((detail, handle)) = detail {
         let s = app.scale_factor;
         let patch = image(handle.clone())
             .width(detail.width as f32 / s)
