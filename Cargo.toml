@@ -26,7 +26,13 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphic
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
+# Measured on Windows: "s" and "abort" each cut the executable by about a
+# fifth (13.2 MB to 8.0 MB together) with no measurable change in CPU or
+# memory. "abort" means an internal error closes the app instead of only
+# stopping the PDF thread; both would be bugs either way.
 [profile.release]
+opt-level = "s"
+panic = "abort"
 lto = true
 codegen-units = 1
 strip = true

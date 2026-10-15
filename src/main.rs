@@ -232,6 +232,8 @@ pub enum Message {
     SetAlwaysShowToolbars(bool),
     SetDefaultZoom(Zoom),
     SetScrollSpeed(f32),
+    /// The scroll speed slider was let go, so its value is final.
+    SaveSettings,
     SystemTheme(iced::theme::Mode),
 }
 
@@ -617,10 +619,8 @@ impl App {
                 self.settings.default_zoom = zoom;
                 self.settings.save();
             }
-            Message::SetScrollSpeed(speed) => {
-                self.settings.scroll_speed = speed;
-                self.settings.save();
-            }
+            Message::SetScrollSpeed(speed) => self.settings.scroll_speed = speed,
+            Message::SaveSettings => self.settings.save(),
             Message::SystemTheme(mode) => self.system_dark = mode != iced::theme::Mode::Light,
         }
         Task::none()

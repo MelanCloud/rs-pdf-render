@@ -528,7 +528,10 @@ fn settings(app: &App) -> Element<'_, Message> {
     let [a, b, c, d]: [Element<_>; 4] = zooms;
     let zooms = column![row![a, b].spacing(2), row![c, d].spacing(2)].spacing(2);
     let speed = row![
-        slider(SCROLL_SPEEDS, app.settings.scroll_speed, Message::SetScrollSpeed).step(10.0_f32).style(slider_style),
+        slider(SCROLL_SPEEDS, app.settings.scroll_speed, Message::SetScrollSpeed)
+            .step(10.0_f32)
+            .on_release(Message::SaveSettings)
+            .style(slider_style),
         text!("{} px", app.settings.scroll_speed).size(12).style(muted).width(44).align_x(iced::Right),
     ]
     .spacing(8)
