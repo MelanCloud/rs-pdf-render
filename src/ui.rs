@@ -398,8 +398,19 @@ fn page<'a>(app: &'a App, doc: &'a Document, index: usize) -> Element<'a, Messag
         // sits between pixel rows, which smooth scrolling and exact jumps
         // cause. Stretched (mid-zoom, or past the size cap) it blends.
         let exact = (bitmap.width as f32 - page.size.width * doc.zoom * PT_TO_PX * app.scale_factor).abs() < 1.0;
-        let filter = if exact { image::FilterMethod::Nearest } else { image::FilterMethod::Linear };
-        layers = layers.push(image(handle.clone()).width(Fill).height(Fill).rotation(turn).filter_method(filter));
+        let picture = image(handle.clone()).rotation(turn);
+        layers = layers.push(match handle {
+            // Laid out at the bitmap's whole-pixel size, not the page's
+            // fractional one: iced rounds each edge to the pixel grid, so a
+            // fractional size would repeat or drop one pixel column (or row)
+            // somewhere, a straight seam through the text.
+            image::Handle::Rgba { width, height, .. } if exact => {
+                let (w, h) = (*width as f32 / app.scale_factor, *height as f32 / app.scale_factor);
+                let (w, h) = if doc.rotation.is_multiple_of(180) { (w, h) } else { (h, w) };
+                picture.width(w).height(h).filter_method(image::FilterMethod::Nearest)
+            }
+            _ => picture.width(Fill).height(Fill).filter_method(image::FilterMethod::Linear),
+        });
     }
     // The sharp part in view, when zoomed in too far to render the page whole.
     if let Some((detail, handle)) = &page.detail
