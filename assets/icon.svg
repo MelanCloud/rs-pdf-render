@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="sky" gradientUnits="userSpaceOnUse" x1="0" y1="53" x2="0" y2="203">
+      <stop offset="0" stop-color="#5cb6ff"/>
+      <stop offset="1" stop-color="#1668d8"/>
+    </linearGradient>
+  </defs>
+  <!-- The cloud: three puffs on a rounded base. -->
+  <g fill="url(#sky)" transform="translate(-12 13)">
+    <circle cx="92" cy="134" r="50"/>
+    <circle cx="146" cy="104" r="64"/>
+    <circle cx="196" cy="148" r="42"/>
+    <rect x="42" y="134" width="196" height="56" rx="28"/>
+  </g>
+  <!-- The paperclip (Lucide's "paperclip", ISC license), with a soft shadow. -->
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round" transform="translate(56 58) scale(6)">
+    <path d="m16 6-8.414 8.586a2 2 0 0 0 2.829 2.829l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551"
+          stroke="#0b3f8f" stroke-opacity="0.35" stroke-width="2.6" transform="translate(0.15 0.5)"/>
+    <path d="m16 6-8.414 8.586a2 2 0 0 0 2.829 2.829l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551"
+          stroke="#ffffff" stroke-width="2.6"/>
+  </g>
+</svg>

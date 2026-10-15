@@ -58,6 +58,8 @@ fn main() -> iced::Result {
         .window(window::Settings {
             size: Size::new(1000.0, 800.0),
             min_size: Some(Size::new(520.0, 320.0)),
+            // Windows and Linux show it in the taskbar; macOS uses the app bundle's.
+            icon: window::icon::from_rgba(include_bytes!("../assets/icon-64.rgba").to_vec(), 64, 64).ok(),
             decorations: false,
             // Closing goes through `Message::Close`, which saves where the
             // open file was left first.

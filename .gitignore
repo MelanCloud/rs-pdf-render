@@ -2,3 +2,4 @@
 /libpdfium.*
 /pdfium.dll
 /CLAUDE.md
+/pdfium-*/
