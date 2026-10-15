@@ -5,21 +5,36 @@
 <h1 align="center">rs-pdf-render</h1>
 
 <p align="center">
-  An ultralightweight PDF reader for the desktop, built on Rust.<br>
+  A small, fast PDF reader for the desktop, written in Rust.<br>
   Built because, as a student, I just wanted something to read PDFs with and
   not have a web browser drink my RAM or Adobe Acrobat's clunk around.
 </p>
 
 <p align="center">
-  <img src="docs/screenshot.png" width="640" alt="rs-pdf-render showing a textbook, with the toolbar at the top and the file name at the bottom">
+  <a href="https://github.com/MelanCloud/rs-pdf-render/releases/latest"><b>Download for Windows</b></a>
+  ·
+  <a href="#features">Features</a>
+  ·
+  <a href="#keyboard-and-mouse">Shortcuts</a>
+  ·
+  <a href="#building">Building</a>
+</p>
+
+<p align="center">
+  <img src="docs/screenshot.png" width="640" alt="rs-pdf-render showing a document, with the toolbar at the top and the file name at the bottom">
 </p>
 
 It looks and behaves like Firefox's PDF viewer, minus everything a reader
 doesn't need. The window has no frame: the toolbar slides in when the mouse
 nears the top or bottom edge, and gets out of the way while you read.
 
-It never changes your PDFs. Drawings stay on screen only, until you close the
-file or print it.
+- **Light.** One small program. A 1,100-page textbook stays at about 120 MB
+  of memory, because only the pages near the view are kept.
+- **Sharp.** Pages are drawn by [MuPDF](https://mupdf.com) and shown pixel
+  for pixel, so text stays crisp and dark at any zoom.
+- **Hands off your files.** It never changes a PDF. Drawings stay on screen
+  only, until you close the file or print it.
+- **Private.** It works offline and sends nothing anywhere.
 
 ## Download
 
@@ -44,33 +59,28 @@ there are no ready-made packages for them yet.
 
 ## Features
 
-- **Reading:** pages render sharp at any zoom, and only the pages near the
-  view are kept in memory, so 1000-page textbooks stay light.
 - **Zoom:** buttons, a box to type any zoom (`150` or `150%`), Ctrl + mouse
   wheel around the pointer, and pdf.js's zoom modes: Automatic, Page fit,
   Page width and 100%. The zoom level shows briefly in the bottom-right
-  corner while you zoom, like Acrobat, and text stays sharp even at 1000%.
-- **Pages:** a box to type the page number next to the page count, and
-  rotate counterclockwise.
+  corner, like Acrobat. Text stays sharp even at 1000%.
+- **Pages:** type a page number next to the page count, or rotate
+  counterclockwise.
 - **Outline:** the document's table of contents in a sidebar. Optionally,
   the app scans the text for numbered subsections like "2.6.4" and adds them,
   for books whose own outline stops at the sections.
-- **Links:** page links jump to the right spot, and web and email links open
-  in your browser. Back and Forward return you after following a link or an
-  outline entry.
+- **Links:** page links jump to the right spot; web and email links open in
+  your browser. Back and Forward return you after a link or an outline entry.
 - **Picks up where you left off:** each file reopens at the same page, zoom
   and rotation.
 - **Pen:** a simple pen with four colors, undo and redo.
-- **Print:** the system print dialog, with your drawings included. On
-  Windows, pages go to the printer at its full resolution, so text stays
-  sharp.
+- **Print:** the system print dialog, with your drawings included.
 - **Password-protected PDFs:** it asks for the password, like Firefox.
 - **Light, dark or system theme.**
 - **Settings** (the gear button): smooth scrolling, sliding or instant
   toolbars, always-visible toolbars, the zoom for new files, the scroll
-  speed per wheel notch, and scanning for numbered subsections (off by
-  default; what it finds is forgotten when the file closes). Smooth scrolling and sliding toolbars start off if
-  Windows' "Animation effects" are off.
+  speed per wheel notch, and the subsection scan (off by default; what it
+  finds is forgotten when the file closes). Smooth scrolling and sliding
+  toolbars start off if Windows' "Animation effects" are off.
 
 ## Keyboard and mouse
 
@@ -96,23 +106,22 @@ maximize.
 
 ## Privacy
 
-The app works offline and sends nothing anywhere. Web links in a PDF open in
-your browser only when you click them. The only files it writes are its own
-settings and the reading positions of the last 50 files, in
-`%APPDATA%\rs-pdf-render` (`~/Library/Application Support/rs-pdf-render` on
-macOS, `~/.config/rs-pdf-render` on Linux).
+The app sends nothing anywhere. Web links in a PDF open in your browser only
+when you click them. The only files it writes are its own settings and the
+reading positions of the last 50 files, in `%APPDATA%\rs-pdf-render`
+(`~/Library/Application Support/rs-pdf-render` on macOS,
+`~/.config/rs-pdf-render` on Linux).
 
 ## Building
 
 You need [Rust](https://rustup.rs), a C compiler and LLVM's libclang: the
-first build compiles [MuPDF](https://mupdf.com) into the app, which takes a
-few minutes.
+first build compiles MuPDF into the app, which takes a few minutes.
 
-- **Windows:** Visual Studio 2022 (or its Build Tools) with "Desktop
-  development with C++", and LLVM (`winget install LLVM.LLVM`).
-- **macOS:** the Xcode command line tools (`xcode-select --install`).
-- **Linux:** a C compiler, `make` and libclang (on Debian and Ubuntu:
-  `sudo apt install build-essential libclang-dev`).
+| System | Install |
+| --- | --- |
+| Windows | Visual Studio 2022 (or its Build Tools) with "Desktop development with C++", and LLVM: `winget install LLVM.LLVM` |
+| macOS | The Xcode command line tools: `xcode-select --install` |
+| Linux | A C compiler, `make` and libclang; on Debian and Ubuntu: `sudo apt install build-essential libclang-dev` |
 
 Then:
 
@@ -123,22 +132,15 @@ cargo run --release -- path/to/file.pdf
 The result is a single executable, `target/release/rs-pdf-render` (`.exe` on
 Windows), with nothing else to copy along.
 
-### Windows installer
+**Windows installer:** with [Inno Setup 6](https://jrsoftware.org/isinfo.php)
+installed (`winget install JRSoftware.InnoSetup`), run
+`ISCC installer\rs-pdf-render.iss` after the release build. The installer
+lands in `target/installer/`.
 
-With [Inno Setup 6](https://jrsoftware.org/isinfo.php) installed (for example
-`winget install JRSoftware.InnoSetup`):
+### Printing on each system
 
-```sh
-cargo build --release
-ISCC installer\rs-pdf-render.iss
-```
-
-The installer lands in `target/installer/`.
-
-## Printing on each system
-
-- **Windows:** the system print dialog, then the app draws the pages for
-  the printer at its resolution.
+- **Windows:** the system print dialog, then the app draws the pages for the
+  printer at its full resolution.
 - **macOS:** the system print sheet, with a preview.
 - **Linux:** the document goes to the default printer with `lp`.
 
@@ -147,7 +149,7 @@ The installer lands in `target/installer/`.
 - [MuPDF](https://mupdf.com) (AGPL-3.0, by Artifex) renders the pages,
   through the [mupdf](https://github.com/messense/mupdf-rs) Rust crate. Its
   license and those of the libraries built into it are in
-  [licenses](licenses), which the installer and the portable `.zip` include.
+  [licenses](licenses); the installer and the portable `.zip` include them.
 - [iced](https://github.com/iced-rs/iced) (MIT) draws the interface.
 - The icons, including the paperclip in the app icon, are from
   [Lucide](https://lucide.dev) (ISC).

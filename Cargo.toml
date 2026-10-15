@@ -1,6 +1,6 @@
 [package]
 name = "rs-pdf-render"
-version = "2.0.0"
+version = "0.2.0"
 edition = "2024"
 description = "An ultralightweight PDF reader"
 license = "AGPL-3.0-or-later"
