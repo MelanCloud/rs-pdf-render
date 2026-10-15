@@ -41,6 +41,31 @@ pub struct Bitmap {
     pub subpixel: bool,
 }
 
+/// A part of a page rendered at full sharpness, for zooms where the whole
+/// page would be too big a bitmap. In pixels of the full-size page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Detail {
+    /// The full page's width at this zoom, which the rest is measured in.
+    pub page_width: u32,
+    pub subpixel: bool,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Detail {
+    /// Whether this already shows all of `other`.
+    pub fn covers(&self, other: &Detail) -> bool {
+        self.page_width == other.page_width
+            && self.subpixel == other.subpixel
+            && self.x <= other.x
+            && self.y <= other.y
+            && self.x + self.width >= other.x + other.width
+            && self.y + self.height >= other.y + other.height
+    }
+}
+
 /// A rendered page and its links.
 pub type Rendered = (image::Handle, Vec<Link>);
 
@@ -76,6 +101,7 @@ pub struct Heading {
 enum Request {
     Open(PathBuf, Option<String>, oneshot::Sender<Result<DocInfo, OpenError>>),
     Render(usize, Bitmap, oneshot::Sender<Option<Rendered>>),
+    RenderDetail(usize, Detail, oneshot::Sender<Option<image::Handle>>),
     #[cfg(not(windows))]
     Export(Vec<(usize, Stroke)>, oneshot::Sender<Result<Vec<u8>, String>>),
     Scan(std::ops::Range<usize>, oneshot::Sender<Vec<Heading>>),
@@ -89,30 +115,44 @@ pub struct Worker {
     tx: mpsc::UnboundedSender<Request>,
     /// Page index -> bitmap the UI still wants. Renders for anything else
     /// (scrolled away, zoom or rotation changed since) are skipped.
-    wanted: Arc<Mutex<HashMap<usize, Bitmap>>>,
+    wanted: Wanted<Bitmap>,
+    /// The same for sharp details.
+    wanted_details: Wanted<Detail>,
 }
+
+/// Page index -> what the UI still wants rendered for it, shared with the
+/// PDFium thread.
+type Wanted<T> = Arc<Mutex<HashMap<usize, T>>>;
 
 impl Worker {
     pub fn spawn() -> Result<Self, String> {
         let bindings = bind()?;
         let (tx, rx) = mpsc::unbounded_channel();
         let wanted = Arc::new(Mutex::new(HashMap::new()));
-        let shared = wanted.clone();
+        let wanted_details = Arc::new(Mutex::new(HashMap::new()));
+        let shared = (wanted.clone(), wanted_details.clone());
         std::thread::Builder::new()
             .name("pdfium".into())
             .spawn(move || run(Pdfium::new(bindings), rx, shared))
             .map_err(|e| e.to_string())?;
-        Ok(Self { tx, wanted })
+        Ok(Self { tx, wanted, wanted_details })
     }
 
-    pub fn set_wanted(&self, wanted: HashMap<usize, Bitmap>) {
+    pub fn set_wanted(&self, wanted: HashMap<usize, Bitmap>, details: HashMap<usize, Detail>) {
         *self.wanted.lock().unwrap() = wanted;
+        *self.wanted_details.lock().unwrap() = details;
     }
 
     pub async fn open(self, path: PathBuf, password: Option<String>) -> Result<DocInfo, OpenError> {
         let (reply, rx) = oneshot::channel();
         let _ = self.tx.send(Request::Open(path, password, reply));
         rx.await.unwrap_or_else(|_| Err(OpenError::Failed("PDF engine stopped".into())))
+    }
+
+    pub async fn render_detail(self, page: usize, detail: Detail) -> Option<image::Handle> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(Request::RenderDetail(page, detail, reply));
+        rx.await.ok().flatten()
     }
 
     pub async fn render(self, page: usize, bitmap: Bitmap) -> Option<Rendered> {
@@ -169,7 +209,7 @@ fn bind() -> Result<Box<dyn PdfiumLibraryBindings>, String> {
 fn run(
     pdfium: Pdfium,
     mut rx: mpsc::UnboundedReceiver<Request>,
-    wanted: Arc<Mutex<HashMap<usize, Bitmap>>>,
+    (wanted, wanted_details): (Wanted<Bitmap>, Wanted<Detail>),
 ) {
     // The document on screen, with the password that unlocked it.
     let mut open: Option<(PathBuf, Option<String>, PdfDocument)> = None;
@@ -206,6 +246,14 @@ fn run(
                     .as_ref()
                     .filter(|_| still_wanted)
                     .and_then(|(_, _, doc)| render(doc, index, bitmap));
+                let _ = reply.send(image);
+            }
+            Request::RenderDetail(index, detail, reply) => {
+                let still_wanted = wanted_details.lock().unwrap().get(&index) == Some(&detail);
+                let image = open
+                    .as_ref()
+                    .filter(|_| still_wanted)
+                    .and_then(|(_, _, doc)| render_detail(doc, index, detail));
                 let _ = reply.send(image);
             }
             Request::Scan(pages, reply) => {
@@ -438,6 +486,21 @@ fn render(doc: &PdfDocument, index: usize, bitmap: Bitmap) -> Option<Rendered> {
     let bitmap = page.render_with_config(&config).ok()?;
     let image = image::Handle::from_rgba(bitmap.width() as u32, bitmap.height() as u32, bitmap.as_rgba_bytes());
     Some((image, links(doc, &page)))
+}
+
+/// Renders part of a page into a bitmap of just that size, by putting the
+/// page's top-left corner off the bitmap's edge.
+fn render_detail(doc: &PdfDocument, index: usize, detail: Detail) -> Option<image::Handle> {
+    let page = doc.pages().get(index as PdfPageIndex).ok()?;
+    let config = PdfRenderConfig::new()
+        .set_target_width(detail.page_width as Pixels)
+        .use_lcd_text_rendering(detail.subpixel)
+        .set_format(PdfBitmapFormat::BGRx)
+        .set_origin(-(detail.x as Pixels), -(detail.y as Pixels))
+        .render_form_data(true);
+    let mut bitmap = PdfBitmap::empty(detail.width as Pixels, detail.height as Pixels, PdfBitmapFormat::BGRx).ok()?;
+    page.render_into_bitmap_with_config(&mut bitmap, &config).ok()?;
+    Some(image::Handle::from_rgba(detail.width, detail.height, bitmap.as_rgba_bytes()))
 }
 
 /// Size of the virtual bitmap used to turn PDF points into fractions of the

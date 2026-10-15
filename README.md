@@ -48,7 +48,8 @@ there are no ready-made packages for them yet.
   view are kept in memory, so 1000-page textbooks stay light.
 - **Zoom:** buttons, a box to type any zoom (`150` or `150%`), Ctrl + mouse
   wheel around the pointer, and pdf.js's zoom modes: Automatic, Page fit,
-  Page width and 100%.
+  Page width and 100%. The zoom level shows briefly in the bottom-right
+  corner while you zoom, like Acrobat, and text stays sharp even at 1000%.
 - **Pages:** a box to type the page number next to the page count, and
   rotate counterclockwise.
 - **Outline:** the document's table of contents in a sidebar. Optionally,

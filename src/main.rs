@@ -9,7 +9,7 @@ mod system;
 mod ui;
 
 use ink::Stroke;
-use pdf::{Bitmap, Heading, Link, OpenError, OutlineEntry, Target, Worker};
+use pdf::{Bitmap, Detail, Heading, Link, OpenError, OutlineEntry, Target, Worker};
 use settings::{Position, Settings, ThemeChoice, Zoom};
 
 use iced::time::Instant;
@@ -37,6 +37,10 @@ const REVEAL_DISTANCE: f32 = 12.0;
 const HIDE_DISTANCE: f32 = 40.0;
 /// Pages scanned for headings per request, so page renders can go in between.
 const SCAN_BATCH: usize = 8;
+/// How long the zoom indicator stays after the zoom changes, then how long
+/// it takes to fade.
+const ZOOM_SHOWN: Duration = Duration::from_millis(1200);
+const ZOOM_FADE: Duration = Duration::from_millis(250);
 /// How long a smooth scroll takes to settle.
 const GLIDE: Duration = Duration::from_millis(160);
 const DOCUMENT: &str = "document";
@@ -97,6 +101,8 @@ pub struct App {
     locked: Option<Locked>,
     settings: Settings,
     menu: Option<Menu>,
+    /// When the user last zoomed, for the zoom indicator in the corner.
+    zoomed_at: Option<Instant>,
     /// The pointer is over the open dropdown, so a click there keeps it open.
     over_menu: bool,
     /// The dropdown the last mouse press closed, so that clicking its own
@@ -182,6 +188,9 @@ pub struct Page {
     size: Size,
     image: Option<(Bitmap, image::Handle)>,
     pending: Option<Bitmap>,
+    /// When the page is too big to render whole, the part in view, sharp.
+    detail: Option<(Detail, image::Handle)>,
+    pending_detail: Option<Detail>,
     strokes: Vec<Stroke>,
     /// Kept when the bitmap is dropped; they're small.
     links: Vec<Link>,
@@ -212,6 +221,7 @@ pub enum Message {
     /// Escape, even when a text box takes it.
     Escape,
     Rendered { doc: u64, page: usize, bitmap: Bitmap, rendered: Option<pdf::Rendered> },
+    DetailRendered { doc: u64, page: usize, detail: Detail, image: Option<image::Handle> },
 
     Scrolled(scrollable::Viewport),
     ZoomIn,
@@ -284,6 +294,7 @@ impl App {
             locked: None,
             settings: Settings::load(),
             menu: None,
+            zoomed_at: None,
             over_menu: false,
             closed_by_press: None,
             system_dark: true,
@@ -310,6 +321,28 @@ impl App {
             ThemeChoice::Dark => true,
         };
         if dark { iced::Theme::Dark } else { iced::Theme::Light }
+    }
+
+    /// Shows the zoom indicator, like Acrobat's, after the user zooms.
+    fn show_zoom(&mut self) {
+        if self.doc.is_some() {
+            self.now = Instant::now();
+            self.zoomed_at = Some(self.now);
+        }
+    }
+
+    /// How visible the zoom indicator is, from 0 to 1: shown for a moment,
+    /// then fading out (or gone at once with animations off).
+    fn zoom_opacity(&self) -> f32 {
+        let Some(at) = self.zoomed_at else { return 0.0 };
+        let past = self.now.saturating_duration_since(at);
+        if past <= ZOOM_SHOWN {
+            1.0
+        } else if self.settings.animate_toolbars {
+            1.0 - ((past - ZOOM_SHOWN).as_secs_f32() / ZOOM_FADE.as_secs_f32()).min(1.0)
+        } else {
+            0.0
+        }
     }
 
     /// How much of the toolbars shows, from 0 to `TOOLBAR_HEIGHT`.
@@ -343,7 +376,7 @@ impl App {
         let keys = keyboard::listen().map(Message::Key);
         let animating = self.settings.animate_toolbars && self.toolbar.is_animating(self.now);
         let gliding = self.doc.as_ref().is_some_and(|doc| doc.glide.is_some());
-        let frames = if animating || gliding {
+        let frames = if animating || gliding || self.zoomed_at.is_some() {
             window::frames().map(Message::Frame)
         } else {
             Subscription::none()
@@ -355,6 +388,9 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         if matches!(message, Message::PickFile | Message::Print) {
             self.menu = None;
+        }
+        if matches!(message, Message::ZoomIn | Message::ZoomOut | Message::ZoomSubmit | Message::WheelZoom(..)) {
+            self.show_zoom();
         }
         match message {
             Message::WindowReady(id, scale) => {
@@ -395,6 +431,9 @@ impl App {
             Message::Key(event) => return self.key(event),
             Message::Frame(now) => {
                 self.now = now;
+                if self.zoomed_at.is_some_and(|at| now.duration_since(at) > ZOOM_SHOWN + ZOOM_FADE) {
+                    self.zoomed_at = None;
+                }
                 let Some(doc) = &mut self.doc else { return Task::none() };
                 let Some(glide) = doc.glide else { return Task::none() };
                 // Ease out: fast at first, settling gently, like Chromium.
@@ -471,6 +510,21 @@ impl App {
                     if let Some((image, links)) = rendered {
                         page.image = Some((bitmap, image));
                         page.links = links;
+                    }
+                }
+            }
+
+            Message::DetailRendered { doc, page, detail, image } => {
+                if let Some(page) = self
+                    .doc
+                    .as_mut()
+                    .filter(|d| d.id == doc)
+                    .and_then(|d| d.pages.get_mut(page))
+                    .filter(|p| p.pending_detail == Some(detail))
+                {
+                    page.pending_detail = None;
+                    if let Some(image) = image {
+                        page.detail = Some((detail, image));
                     }
                 }
             }
@@ -710,6 +764,7 @@ impl App {
             Key::Character("=" | "+") if modifiers.command() => return self.update(Message::ZoomIn),
             Key::Character("-") if modifiers.command() => return self.update(Message::ZoomOut),
             Key::Character("0") if modifiers.command() => {
+                self.show_zoom();
                 let mode = self.settings.default_zoom;
                 let task = self.zoom(self.fit_zoom(mode), None);
                 if let Some(doc) = &mut self.doc {
@@ -787,6 +842,8 @@ impl App {
                     size: Size::new(w, h),
                     image: None,
                     pending: None,
+                    detail: None,
+                    pending_detail: None,
                     strokes: Vec::new(),
                     links: Vec::new(),
                 })
@@ -1005,6 +1062,8 @@ impl App {
         let mut most_visible = (0.0, doc.current);
         let mut keep_current = false;
         let mut wanted = HashMap::new();
+        let mut wanted_details = HashMap::new();
+        let content_width = doc.content_size(view).width;
         let mut tasks = Vec::new();
 
         for (index, top) in tops.into_iter().enumerate() {
@@ -1019,16 +1078,60 @@ impl App {
             if bottom < near_start || top > near_end {
                 page.image = None;
                 page.pending = None;
+                page.detail = None;
+                page.pending_detail = None;
                 continue;
             }
 
-            let mut width = page.size.width * doc.zoom * PT_TO_PX * scale_factor;
-            let pixels = width * width * page.size.height / page.size.width;
-            if pixels > MAX_BITMAP_PIXELS {
-                width *= (MAX_BITMAP_PIXELS / pixels).sqrt();
-            }
+            let full_width = page.size.width * doc.zoom * PT_TO_PX * scale_factor;
+            let pixels = full_width * full_width * page.size.height / page.size.width;
+            let capped = pixels > MAX_BITMAP_PIXELS;
+            let width = if capped { full_width * (MAX_BITMAP_PIXELS / pixels).sqrt() } else { full_width };
             let width = width.round().max(1.0) as u32;
             let bitmap = Bitmap { width, subpixel: doc.rotation == 0 };
+
+            // Zoomed in too far to render the whole page sharp, like pdf.js:
+            // render the part in view (plus a quarter screen around it) at
+            // full sharpness, on top of the stretched page. Unrotated pages
+            // only.
+            let in_view = |margin: f32| {
+                let left = (content_width - size.width) / 2.0;
+                let (mx, my) = (view.width * margin, view.height * margin);
+                let x0 = (doc.offset.x - mx - left).max(0.0);
+                let x1 = (doc.offset.x + view.width + mx - left).min(size.width);
+                let y0 = (doc.offset.y - my - top).max(0.0);
+                let y1 = (doc.offset.y + view.height + my - top).min(size.height);
+                (x1 > x0 && y1 > y0).then(|| Detail {
+                    page_width: full_width.round() as u32,
+                    subpixel: true,
+                    x: (x0 * scale_factor).floor() as u32,
+                    y: (y0 * scale_factor).floor() as u32,
+                    width: ((x1 - x0) * scale_factor).ceil() as u32,
+                    height: ((y1 - y0) * scale_factor).ceil() as u32,
+                })
+            };
+            match in_view(0.0).filter(|_| capped && doc.rotation == 0) {
+                None => {
+                    page.detail = None;
+                    page.pending_detail = None;
+                }
+                Some(needed) => {
+                    let shown = page.detail.as_ref().is_some_and(|(have, _)| have.covers(&needed));
+                    let coming = page.pending_detail.is_some_and(|pending| pending.covers(&needed));
+                    if let Some(detail) = page.detail.as_ref().map(|(have, _)| *have).filter(|_| shown) {
+                        wanted_details.insert(index, detail);
+                    } else if let Some(pending) = page.pending_detail.filter(|_| coming) {
+                        wanted_details.insert(index, pending);
+                    } else if let Some(detail) = in_view(0.25) {
+                        page.pending_detail = Some(detail);
+                        wanted_details.insert(index, detail);
+                        let id = doc.id;
+                        tasks.push(Task::perform(worker.clone().render_detail(index, detail), move |image| {
+                            Message::DetailRendered { doc: id, page: index, detail, image }
+                        }));
+                    }
+                }
+            }
             wanted.insert(index, bitmap);
             if page.image.as_ref().is_some_and(|(have, _)| *have == bitmap) || page.pending == Some(bitmap) {
                 continue;
@@ -1043,7 +1146,7 @@ impl App {
         if !keep_current {
             doc.current = most_visible.1;
         }
-        worker.set_wanted(wanted);
+        worker.set_wanted(wanted, wanted_details);
         Task::batch(tasks)
     }
 }

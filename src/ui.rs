@@ -121,6 +121,30 @@ pub fn view(app: &App) -> Element<'_, Message> {
             layers = layers.push(container(bar).height(Fill).align_y(iced::Bottom));
         }
     }
+    let opacity = app.zoom_opacity();
+    if let Some(doc) = &app.doc
+        && opacity > 0.0
+    {
+        let label = text!("{}%", (doc.zoom * 100.0).round()).size(13);
+        let pill = container(label).padding([6, 12]).style(move |theme| {
+            let style = toast(theme);
+            container::Style {
+                background: style.background.map(|background| background.scale_alpha(opacity)),
+                text_color: style.text_color.map(|color| color.scale_alpha(opacity)),
+                border: Border { color: style.border.color.scale_alpha(opacity), ..style.border },
+                shadow: Shadow { color: style.shadow.color.scale_alpha(opacity), ..style.shadow },
+                ..style
+            }
+        });
+        layers = layers.push(
+            container(pill)
+                .width(Fill)
+                .height(Fill)
+                .align_x(iced::Right)
+                .align_y(iced::Bottom)
+                .padding(iced::Padding::new(16.0).bottom(16.0 + reveal)),
+        );
+    }
     if let (Some(error), Some(_)) = (&app.error, &app.doc) {
         layers = layers.push(
             container(
@@ -370,6 +394,16 @@ fn page<'a>(app: &'a App, doc: &'a Document, index: usize) -> Element<'a, Messag
     if let Some((_, handle)) = &page.image {
         let turn = Rotation::Solid(Radians(f32::from(doc.rotation).to_radians()));
         layers = layers.push(image(handle.clone()).width(Fill).height(Fill).rotation(turn));
+    }
+    // The sharp part in view, when zoomed in too far to render the page whole.
+    if let Some((detail, handle)) = &page.detail
+        && doc.rotation == 0
+        && (detail.page_width as f32 - size.width * app.scale_factor).abs() < 1.0
+    {
+        let s = app.scale_factor;
+        let patch = image(handle.clone()).width(detail.width as f32 / s).height(detail.height as f32 / s);
+        let at = iced::Padding::ZERO.top(detail.y as f32 / s).left(detail.x as f32 / s);
+        layers = layers.push(container(patch).padding(at));
     }
     if app.drawing || !page.strokes.is_empty() {
         let ink = Ink {
