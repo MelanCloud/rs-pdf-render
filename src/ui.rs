@@ -1,10 +1,12 @@
 use crate::ink::{Ink, WheelZoom};
-use crate::{App, DOCUMENT, Document, GAP, Message, PT_TO_PX, SCROLLBAR_WIDTH, SIDEBAR_WIDTH, TOOLBAR_HEIGHT};
+use crate::{
+    App, DOCUMENT, Document, GAP, Locked, Message, PASSWORD, PT_TO_PX, SCROLLBAR_WIDTH, SIDEBAR_WIDTH, TOOLBAR_HEIGHT,
+};
 
 use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::{
-    button, canvas, column, container, image, mouse_area, row, scrollable, space, stack, svg, text,
-    text_input, tooltip,
+    button, canvas, column, container, image, mouse_area, opaque, row, scrollable, space, stack, svg,
+    text, text_input, tooltip,
 };
 use iced::{Background, Border, Center, Color, Element, Fill, Radians, Rotation, Shadow, Vector};
 
@@ -37,6 +39,9 @@ const TEXT: Color = Color::from_rgb8(0xf9, 0xf9, 0xfa);
 const MUTED: Color = Color::from_rgb8(0xb1, 0xb1, 0xb3);
 const ACCENT: Color = Color::from_rgb8(0x0a, 0x84, 0xff);
 
+const PAGE_FIELD_WIDTH: f32 = 44.0;
+const ZOOM_FIELD_WIDTH: f32 = 62.0;
+
 pub fn view(app: &App) -> Element<'_, Message> {
     let reveal = app.toolbar.interpolate(0.0, TOOLBAR_HEIGHT, app.now);
 
@@ -47,6 +52,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
     };
 
     let mut layers = stack![container(body).width(Fill).height(Fill).style(|_| backdrop())];
+    // Under the toolbar, so another file can still be opened or the window closed.
+    if let Some(locked) = &app.locked {
+        layers = layers.push(password(locked));
+    }
     if reveal > 0.5 {
         layers = layers.push(
             container(toolbar(app))
@@ -71,28 +80,79 @@ pub fn view(app: &App) -> Element<'_, Message> {
     layers.into()
 }
 
+/// Which parts of the toolbar fit. Narrow windows (tiling window managers,
+/// split screen) drop the least needed parts first, so the window buttons
+/// always stay reachable.
+struct Fit {
+    /// The zoom controls sit in the middle of the window, not just between
+    /// the other two groups.
+    centered: bool,
+    zoom: bool,
+    page_count: bool,
+    /// Rotate, print and open.
+    file_tools: bool,
+}
+
+impl Fit {
+    const ALL: Fit = Fit { centered: true, zoom: true, page_count: true, file_tools: true };
+
+    /// Adds up rough widths of each part.
+    fn new(app: &App, doc: &Document) -> Self {
+        const BUTTON: f32 = 32.0;
+        let room = app.window_size.width - 12.0;
+        let window_buttons = 3.0 * BUTTON + 8.0;
+        let mut left = BUTTON + 14.0 + PAGE_FIELD_WIDTH;
+        let mut right = BUTTON * if app.drawing { 6.0 } else { 1.0 };
+        if cfg!(target_os = "macos") {
+            left += window_buttons;
+        } else {
+            right += window_buttons;
+        }
+        let page_count = 24.0 + 7.0 * doc.pages.len().to_string().len() as f32;
+        let file_tools = 3.0 * BUTTON;
+        let zoom = 2.0 * BUTTON + ZOOM_FIELD_WIDTH + 4.0;
+        let all = left + page_count + zoom + right + file_tools;
+        Fit {
+            centered: 2.0 * (left + page_count).max(right + file_tools) + zoom <= room,
+            zoom: all <= room,
+            page_count: all - zoom <= room,
+            file_tools: left + right + file_tools <= room,
+        }
+    }
+}
+
 fn toolbar(app: &App) -> Element<'_, Message> {
     let close = tool(icon::CLOSE, Some(Message::Close), false, "Close");
     let minimize = tool(icon::MINIMIZE, Some(Message::Minimize), false, "Minimize");
     let maximize = tool(icon::MAXIMIZE, Some(Message::ToggleMaximize), false, "Maximize");
     let open = tool(icon::OPEN, Some(Message::PickFile), false, concat!("Open file (", shortcut!("O"), ")"));
 
-    let (start, middle, end) = match &app.doc {
-        Some(doc) => document_tools(app, doc),
+    let fit = app.doc.as_ref().map_or(Fit::ALL, |doc| Fit::new(app, doc));
+    let (start, middle, mut end) = match &app.doc {
+        Some(doc) => document_tools(app, doc, &fit),
         None => (row![], row![], row![]),
     };
+    if fit.file_tools {
+        end = end.push(open);
+    }
     // Window buttons go where each platform normally puts them.
     let (start, end) = if cfg!(target_os = "macos") {
-        (row![close, minimize, maximize, divider(), start], row![end, open])
+        (row![close, minimize, maximize, divider(), start], end)
     } else {
-        (start, row![end, open, divider(), minimize, maximize, close])
+        (start, row![end, divider(), minimize, maximize, close])
     };
 
-    let bar = row![
-        container(start.spacing(2).align_y(Center)).width(Fill),
-        middle.spacing(2).align_y(Center),
-        container(end.spacing(2).align_y(Center)).width(Fill).align_x(iced::Right),
-    ]
+    let (start, end) = (start.spacing(2).align_y(Center), end.spacing(2).align_y(Center));
+    let middle = middle.spacing(2).align_y(Center);
+    let bar = if fit.centered {
+        row![
+            container(start).width(Fill),
+            middle,
+            container(end).width(Fill).align_x(iced::Right),
+        ]
+    } else {
+        row![start, space().width(Fill), middle, space().width(Fill), end]
+    }
     .align_y(Center)
     .padding([0, 6])
     .height(TOOLBAR_HEIGHT);
@@ -105,40 +165,43 @@ fn toolbar(app: &App) -> Element<'_, Message> {
 
 type Row<'a> = iced::widget::Row<'a, Message>;
 
-fn document_tools<'a>(app: &'a App, doc: &'a Document) -> (Row<'a>, Row<'a>, Row<'a>) {
+fn document_tools<'a>(app: &'a App, doc: &'a Document, fit: &Fit) -> (Row<'a>, Row<'a>, Row<'a>) {
     let page = field(
         doc.page_input.clone().unwrap_or_else(|| (doc.current + 1).to_string()),
-        44.0,
+        PAGE_FIELD_WIDTH,
         Message::PageInput,
         Message::PageSubmit,
     );
-    let start = row![
+    let mut start = row![
         tool(icon::SIDEBAR, Some(Message::ToggleSidebar), app.sidebar, "Document outline"),
         divider(),
         page,
-        text!("of {}", doc.pages.len()).size(13).color(MUTED),
     ]
     .spacing(6)
     .align_y(Center);
+    if fit.page_count {
+        start = start.push(text!("of {}", doc.pages.len()).size(13).color(MUTED).wrapping(text::Wrapping::None));
+    }
 
-    let zoom = field(
-        doc.zoom_input.clone().unwrap_or_else(|| format!("{}%", (doc.zoom * 100.0).round())),
-        62.0,
-        Message::ZoomInput,
-        Message::ZoomSubmit,
-    );
-    let middle = row![
-        tool(icon::ZOOM_OUT, Some(Message::ZoomOut), false, concat!("Zoom out (", shortcut!("-"), ")")),
-        zoom,
-        tool(icon::ZOOM_IN, Some(Message::ZoomIn), false, concat!("Zoom in (", shortcut!("+"), ")")),
-    ];
+    let mut middle = row![];
+    if fit.zoom {
+        let zoom = field(
+            doc.zoom_input.clone().unwrap_or_else(|| format!("{}%", (doc.zoom * 100.0).round())),
+            ZOOM_FIELD_WIDTH,
+            Message::ZoomInput,
+            Message::ZoomSubmit,
+        );
+        middle = row![
+            tool(icon::ZOOM_OUT, Some(Message::ZoomOut), false, concat!("Zoom out (", shortcut!("-"), ")")),
+            zoom,
+            tool(icon::ZOOM_IN, Some(Message::ZoomIn), false, concat!("Zoom in (", shortcut!("+"), ")")),
+        ];
+    }
 
-    let mut end = row![tool(
-        icon::ROTATE,
-        Some(Message::RotateCounterclockwise),
-        false,
-        "Rotate counterclockwise"
-    )];
+    let mut end = row![];
+    if fit.file_tools {
+        end = end.push(tool(icon::ROTATE, Some(Message::RotateCounterclockwise), false, "Rotate counterclockwise"));
+    }
     if app.drawing {
         for color in PEN_COLORS {
             end = end.push(swatch(color, app.pen == color));
@@ -150,9 +213,10 @@ fn document_tools<'a>(app: &'a App, doc: &'a Document) -> (Row<'a>, Row<'a>, Row
             concat!("Undo (", shortcut!("Z"), ")"),
         ));
     }
-    let end = end
-        .push(tool(icon::DRAW, Some(Message::ToggleDrawing), app.drawing, "Draw"))
-        .push(tool(icon::PRINT, Some(Message::Print), false, concat!("Print (", shortcut!("P"), ")")));
+    end = end.push(tool(icon::DRAW, Some(Message::ToggleDrawing), app.drawing, "Draw"));
+    if fit.file_tools {
+        end = end.push(tool(icon::PRINT, Some(Message::Print), false, concat!("Print (", shortcut!("P"), ")")));
+    }
 
     (start, middle, end)
 }
@@ -270,24 +334,43 @@ fn welcome(app: &App) -> Element<'_, Message> {
     let open = button(text("Open a PDF").size(14))
         .on_press_maybe(app.pdf.is_ok().then_some(Message::PickFile))
         .padding([8, 16])
-        .style(|_, status| {
-            let base = button::Style {
-                background: Some(ACCENT.into()),
-                text_color: Color::WHITE,
-                border: Border::default().rounded(6),
-                ..button::Style::default()
-            };
-            match status {
-                button::Status::Hovered | button::Status::Pressed => {
-                    button::Style { background: Some(ACCENT.scale_alpha(0.85).into()), ..base }
-                }
-                _ => base,
-            }
-        });
+        .style(|_, status| push(status, ACCENT));
 
     container(column![open, message].spacing(14).align_x(Center))
         .center(Fill)
         .into()
+}
+
+/// pdf.js's password dialog, over a dimmed window.
+fn password(locked: &Locked) -> Element<'_, Message> {
+    let message = if locked.wrong {
+        "Invalid password. Please try again."
+    } else {
+        "Enter the password to open this PDF file."
+    };
+    let input = text_input("", &locked.input)
+        .id(PASSWORD)
+        .secure(true)
+        .on_input(Message::PasswordInput)
+        .on_submit(Message::Unlock)
+        .size(13)
+        .padding([6, 8])
+        .style(field_style);
+    let buttons = row![
+        space().width(Fill),
+        button(text("Cancel").size(13)).on_press(Message::CancelPassword).padding([6, 14]).style(|_, status| push(status, FIELD)),
+        button(text("OK").size(13)).on_press(Message::Unlock).padding([6, 14]).style(|_, status| push(status, ACCENT)),
+    ]
+    .spacing(8);
+
+    let dialog = container(column![text(message).size(13), input, buttons].spacing(12))
+        .width(340)
+        .padding(16)
+        .style(|_| toast());
+    opaque(container(dialog).center(Fill).padding(16).style(|_| container::Style {
+        background: Some(Color::BLACK.scale_alpha(0.4).into()),
+        ..container::Style::default()
+    }))
 }
 
 fn tool<'a>(icon: &'static str, on_press: Option<Message>, active: bool, label: &'a str) -> Element<'a, Message> {
@@ -325,19 +408,34 @@ fn field<'a>(
         .size(13)
         .padding([4, 6])
         .align_x(Center)
-        .style(|_, status| text_input::Style {
-            background: FIELD.into(),
-            border: Border {
-                color: if matches!(status, text_input::Status::Focused { .. }) { ACCENT } else { LINE },
-                width: 1.0,
-                radius: 4.0.into(),
-            },
-            icon: TEXT,
-            placeholder: MUTED,
-            value: TEXT,
-            selection: ACCENT.scale_alpha(0.5),
-        })
+        .style(field_style)
         .into()
+}
+
+fn field_style(_: &iced::Theme, status: text_input::Status) -> text_input::Style {
+    text_input::Style {
+        background: FIELD.into(),
+        border: Border {
+            color: if matches!(status, text_input::Status::Focused { .. }) { ACCENT } else { LINE },
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        icon: TEXT,
+        placeholder: MUTED,
+        value: TEXT,
+        selection: ACCENT.scale_alpha(0.5),
+    }
+}
+
+/// A filled button, like the welcome screen's "Open a PDF".
+fn push(status: button::Status, color: Color) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: Some(if hovered { color.scale_alpha(0.85) } else { color }.into()),
+        text_color: Color::WHITE,
+        border: Border::default().rounded(6),
+        ..button::Style::default()
+    }
 }
 
 fn glyph<'a>(icon: &'static str, size: f32) -> Element<'a, Message> {

@@ -15,6 +15,14 @@ pub struct DocInfo {
     pub outline: Vec<OutlineEntry>,
 }
 
+/// Why a file didn't open.
+#[derive(Debug, Clone)]
+pub enum OpenError {
+    /// The file is locked and needs a password, or the one given was wrong.
+    Password,
+    Failed(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct OutlineEntry {
     pub title: String,
@@ -23,9 +31,12 @@ pub struct OutlineEntry {
 }
 
 enum Request {
-    Open(PathBuf, oneshot::Sender<Result<DocInfo, String>>),
+    Open(PathBuf, Option<String>, oneshot::Sender<Result<DocInfo, OpenError>>),
     Render(usize, u32, oneshot::Sender<Option<image::Handle>>),
+    #[cfg(not(windows))]
     Export(Vec<(usize, Stroke)>, oneshot::Sender<Result<Vec<u8>, String>>),
+    #[cfg(windows)]
+    Print(Vec<(usize, Stroke)>, crate::print::Job, oneshot::Sender<Result<(), String>>),
 }
 
 /// Handle to the PDFium thread. Cheap to clone.
@@ -54,10 +65,10 @@ impl Worker {
         *self.wanted.lock().unwrap() = wanted;
     }
 
-    pub async fn open(self, path: PathBuf) -> Result<DocInfo, String> {
+    pub async fn open(self, path: PathBuf, password: Option<String>) -> Result<DocInfo, OpenError> {
         let (reply, rx) = oneshot::channel();
-        let _ = self.tx.send(Request::Open(path, reply));
-        rx.await.unwrap_or_else(|_| Err("PDF engine stopped".into()))
+        let _ = self.tx.send(Request::Open(path, password, reply));
+        rx.await.unwrap_or_else(|_| Err(OpenError::Failed("PDF engine stopped".into())))
     }
 
     pub async fn render(self, page: usize, width: u32) -> Option<image::Handle> {
@@ -67,9 +78,18 @@ impl Worker {
     }
 
     /// The open document's bytes with the drawings burned in.
+    #[cfg(not(windows))]
     pub async fn export(self, strokes: Vec<(usize, Stroke)>) -> Result<Vec<u8>, String> {
         let (reply, rx) = oneshot::channel();
         let _ = self.tx.send(Request::Export(strokes, reply));
+        rx.await.unwrap_or_else(|_| Err("PDF engine stopped".into()))
+    }
+
+    /// Prints the open document with the drawings burned in.
+    #[cfg(windows)]
+    pub async fn print(self, strokes: Vec<(usize, Stroke)>, job: crate::print::Job) -> Result<(), String> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(Request::Print(strokes, job, reply));
         rx.await.unwrap_or_else(|_| Err("PDF engine stopped".into()))
     }
 }
@@ -100,23 +120,26 @@ fn run(
     mut rx: mpsc::UnboundedReceiver<Request>,
     wanted: Arc<Mutex<HashMap<usize, u32>>>,
 ) {
-    let mut open: Option<(PathBuf, PdfDocument)> = None;
+    // The document on screen, with the password that unlocked it.
+    let mut open: Option<(PathBuf, Option<String>, PdfDocument)> = None;
 
     while let Some(request) = rx.blocking_recv() {
         match request {
-            Request::Open(path, reply) => {
-                open = None;
+            Request::Open(path, password, reply) => {
+                // The current document stays open until the new one has
+                // opened, so a failed open (or a password prompt) leaves it
+                // on screen and working.
                 let result = pdfium
-                    .load_pdf_from_file(&path, None)
+                    .load_pdf_from_file(&path, password.as_deref())
                     .map_err(|e| match e {
-                        PdfiumError::PdfiumLibraryInternalError(
-                            PdfiumInternalError::PasswordError,
-                        ) => "Password-protected PDFs aren't supported yet.".to_string(),
-                        _ => format!("Couldn't open this file ({e})."),
+                        PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError) => {
+                            OpenError::Password
+                        }
+                        _ => OpenError::Failed(format!("Couldn't open this file ({e}).")),
                     })
                     .map(|doc| {
                         let info = describe(&doc);
-                        open = Some((path, doc));
+                        open = Some((path, password, doc));
                         info
                     });
                 let _ = reply.send(result);
@@ -126,12 +149,24 @@ fn run(
                 let image = open
                     .as_ref()
                     .filter(|_| still_wanted)
-                    .and_then(|(_, doc)| render(doc, index, width));
+                    .and_then(|(_, _, doc)| render(doc, index, width));
                 let _ = reply.send(image);
             }
+            #[cfg(not(windows))]
             Request::Export(strokes, reply) => {
                 let result = match &open {
-                    Some((path, _)) => export(&pdfium, path, &strokes),
+                    Some((path, password, _)) => export(&pdfium, path, password.as_deref(), &strokes),
+                    None => Err("No document is open.".into()),
+                };
+                let _ = reply.send(result);
+            }
+            #[cfg(windows)]
+            Request::Print(strokes, job, reply) => {
+                let result = match &open {
+                    Some((path, password, _)) => export(&pdfium, path, password.as_deref(), &strokes).and_then(|pdf| {
+                        let title = path.file_name().unwrap_or_default().to_string_lossy();
+                        crate::print::print(&job, &pdf, &title)
+                    }),
                     None => Err("No document is open.".into()),
                 };
                 let _ = reply.send(result);
@@ -199,14 +234,30 @@ fn render(doc: &PdfDocument, index: usize, width: u32) -> Option<image::Handle> 
     ))
 }
 
-fn export(pdfium: &Pdfium, path: &Path, strokes: &[(usize, Stroke)]) -> Result<Vec<u8>, String> {
-    if strokes.is_empty() {
+/// The file as it should go to the printer: drawings burned in, and never
+/// locked, so the system's printing doesn't need the password.
+fn export(
+    pdfium: &Pdfium,
+    path: &Path,
+    password: Option<&str>,
+    strokes: &[(usize, Stroke)],
+) -> Result<Vec<u8>, String> {
+    if strokes.is_empty() && password.is_none() {
         return std::fs::read(path).map_err(|e| e.to_string());
     }
 
-    let mut doc = pdfium
-        .load_pdf_from_file(path, None)
+    let source = pdfium
+        .load_pdf_from_file(path, password)
         .map_err(|e| e.to_string())?;
+    // PDFium saves a locked file still locked, so a locked file's pages are
+    // copied into a new document instead.
+    let mut doc = if password.is_some() {
+        let mut copy = pdfium.create_new_pdf().map_err(|e| e.to_string())?;
+        copy.pages_mut().append(&source).map_err(|e| e.to_string())?;
+        copy
+    } else {
+        source
+    };
     for (index, stroke) in strokes {
         burn_in(&mut doc, *index, stroke).map_err(|e| e.to_string())?;
     }

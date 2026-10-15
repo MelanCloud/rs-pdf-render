@@ -18,6 +18,10 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 objc2-pdf-kit = { version = "0.3", default-features = false, features = ["std", "PDFDocument", "objc2-app-kit"] }
 raw-window-handle = "0.6"
 
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_System_LibraryLoader", "Win32_UI_Controls_Dialogs"] }
+
 [profile.release]
 lto = true
 codegen-units = 1

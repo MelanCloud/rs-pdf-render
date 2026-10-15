@@ -1,10 +1,13 @@
+// Release builds on Windows shouldn't open a console window next to the app.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod ink;
 mod pdf;
 mod print;
 mod ui;
 
 use ink::Stroke;
-use pdf::{OutlineEntry, Worker};
+use pdf::{OpenError, OutlineEntry, Worker};
 
 use iced::time::Instant;
 use iced::widget::{image, operation, scrollable};
@@ -29,6 +32,7 @@ const REVEAL_DISTANCE: f32 = 12.0;
 /// ...and goes away once the cursor is this far below the toolbar.
 const HIDE_DISTANCE: f32 = 40.0;
 const DOCUMENT: &str = "document";
+const PASSWORD: &str = "password";
 
 fn main() -> iced::Result {
     let path = std::env::args_os().nth(1).map(PathBuf::from);
@@ -60,6 +64,15 @@ pub struct App {
     doc: Option<Document>,
     next_id: u64,
     error: Option<String>,
+    locked: Option<Locked>,
+}
+
+/// A file waiting for its password.
+pub struct Locked {
+    path: PathBuf,
+    input: String,
+    /// The last password tried was wrong.
+    wrong: bool,
 }
 
 pub struct Document {
@@ -107,7 +120,13 @@ pub enum Message {
 
     PickFile,
     Open(PathBuf),
-    Loaded(PathBuf, Result<pdf::DocInfo, String>),
+    /// The file, whether a password was tried, and how opening went.
+    Loaded(PathBuf, bool, Result<pdf::DocInfo, OpenError>),
+    PasswordInput(String),
+    Unlock,
+    CancelPassword,
+    /// Escape, even when a text box takes it.
+    Escape,
     Rendered { doc: u64, page: usize, width: u32, image: Option<image::Handle> },
 
     Scrolled(scrollable::Viewport),
@@ -129,6 +148,8 @@ pub enum Message {
     Undo,
 
     Print,
+    /// The PDF to hand to the system's printing, drawings included.
+    #[cfg(not(windows))]
     Printable(Result<Vec<u8>, String>),
     Printed(Result<(), String>),
     DismissError,
@@ -150,6 +171,7 @@ impl App {
             doc: None,
             next_id: 0,
             error: None,
+            locked: None,
         };
         let ready = window::oldest().and_then(|id| {
             window::scale_factor(id).map(move |scale| Message::WindowReady(id, scale))
@@ -172,6 +194,10 @@ impl App {
             Event::Window(window::Event::FileDropped(path)) => Some(Message::Open(path)),
             Event::Mouse(mouse::Event::CursorMoved { position }) => Some(Message::CursorMoved(position)),
             Event::Mouse(mouse::Event::CursorLeft) => Some(Message::CursorLeft),
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                ..
+            }) => Some(Message::Escape),
             _ => None,
         });
         let keys = keyboard::listen().map(Message::Key);
@@ -225,16 +251,39 @@ impl App {
                 )
                 .and_then(Task::done);
             }
-            Message::Open(path) => {
-                let Ok(worker) = &self.pdf else { return Task::none() };
-                return Task::perform(worker.clone().open(path.clone()), move |result| {
-                    Message::Loaded(path.clone(), result)
-                });
-            }
-            Message::Loaded(path, result) => match result {
-                Ok(info) => return self.load(path, info),
-                Err(error) => self.error = Some(error),
+            Message::Open(path) => return self.open(path, None),
+            Message::Loaded(path, tried_password, result) => match result {
+                Ok(info) => {
+                    self.locked = None;
+                    return self.load(path, info);
+                }
+                // Like pdf.js: ask, and ask again after a wrong password.
+                Err(OpenError::Password) => {
+                    self.locked = Some(Locked { path, input: String::new(), wrong: tried_password });
+                    return operation::focus(PASSWORD);
+                }
+                Err(OpenError::Failed(error)) => {
+                    self.locked = None;
+                    self.error = Some(error);
+                }
             },
+            Message::PasswordInput(text) => {
+                if let Some(locked) = &mut self.locked {
+                    locked.input = text;
+                }
+            }
+            Message::Unlock => {
+                if let Some(locked) = &mut self.locked {
+                    let (path, password) = (locked.path.clone(), std::mem::take(&mut locked.input));
+                    return self.open(path, Some(password));
+                }
+            }
+            Message::CancelPassword => self.locked = None,
+            Message::Escape => {
+                if self.locked.take().is_none() {
+                    self.drawing = false;
+                }
+            }
             Message::Rendered { doc, page, width, image } => {
                 if let Some(page) = self
                     .doc
@@ -304,12 +353,18 @@ impl App {
             }
             Message::GoTo(page) => return self.go_to(page),
             Message::RotateCounterclockwise => {
-                if let Some(doc) = &mut self.doc {
-                    // Keep the top of the current page in view.
-                    doc.rotation = (doc.rotation + 270) % 360;
-                    let page = doc.current;
-                    return self.go_to(page);
+                let Some(doc) = &mut self.doc else { return Task::none() };
+                doc.rotation = (doc.rotation + 270) % 360;
+                let page = doc.current;
+                // Like pdf.js: refit in automatic zoom, and show the top of the
+                // current page.
+                if doc.auto_zoom {
+                    let zoom = self.auto_zoom();
+                    if let Some(doc) = &mut self.doc {
+                        doc.zoom = zoom;
+                    }
                 }
+                return self.go_to(page);
             }
             Message::ToggleSidebar => {
                 self.sidebar = !self.sidebar;
@@ -340,25 +395,41 @@ impl App {
             }
 
             Message::Print => {
-                if let (Some(doc), Ok(worker)) = (&self.doc, &self.pdf) {
-                    let strokes = doc
-                        .pages
-                        .iter()
-                        .enumerate()
-                        .flat_map(|(i, page)| page.strokes.iter().map(move |s| (i, s.clone())))
-                        .collect();
-                    return Task::perform(worker.clone().export(strokes), Message::Printable);
+                let (Some(doc), Ok(worker)) = (&self.doc, &self.pdf) else { return Task::none() };
+                let strokes: Vec<_> = doc
+                    .pages
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, page)| page.strokes.iter().map(move |s| (i, s.clone())))
+                    .collect();
+                // Windows asks for a printer first, then the PDFium thread prints.
+                #[cfg(windows)]
+                {
+                    let Some(id) = self.window else { return Task::none() };
+                    let (worker, pages) = (worker.clone(), doc.pages.len());
+                    return window::run(id, print::owner).then(move |owner| {
+                        let (worker, strokes) = (worker.clone(), strokes.clone());
+                        Task::perform(
+                            async move {
+                                let Some(job) = print::ask(owner, pages).await? else { return Ok(()) };
+                                worker.print(strokes, job).await
+                            },
+                            Message::Printed,
+                        )
+                    });
                 }
+                #[cfg(not(windows))]
+                return Task::perform(worker.clone().export(strokes), Message::Printable);
             }
-            Message::Printable(Ok(bytes)) => {
+            #[cfg(not(windows))]
+            Message::Printable(Ok(pdf)) => {
                 if let Some(id) = self.window {
-                    return window::run(id, move |window| print::print(window, bytes))
-                        .map(Message::Printed);
+                    return window::run(id, move |window| print::print(window, pdf)).map(Message::Printed);
                 }
             }
-            Message::Printable(Err(error)) | Message::Printed(Err(error)) => {
-                self.error = Some(error);
-            }
+            #[cfg(not(windows))]
+            Message::Printable(Err(error)) => self.error = Some(error),
+            Message::Printed(Err(error)) => self.error = Some(error),
             Message::Printed(Ok(())) => {}
             Message::DismissError => self.error = None,
         }
@@ -392,7 +463,6 @@ impl App {
                 return task;
             }
             Key::Character("z") if modifiers.command() => return self.update(Message::Undo),
-            Key::Named(Named::Escape) => self.drawing = false,
             Key::Named(Named::Home) => return self.go_to(0),
             Key::Named(Named::End) => {
                 let last = self.doc.as_ref().map_or(0, |doc| doc.pages.len() - 1);
@@ -405,6 +475,14 @@ impl App {
             _ => {}
         }
         Task::none()
+    }
+
+    fn open(&self, path: PathBuf, password: Option<String>) -> Task<Message> {
+        let Ok(worker) = &self.pdf else { return Task::none() };
+        let tried_password = password.is_some();
+        Task::perform(worker.clone().open(path.clone(), password), move |result| {
+            Message::Loaded(path.clone(), tried_password, result)
+        })
     }
 
     fn show_toolbar(&mut self, show: bool) {
@@ -458,13 +536,6 @@ impl App {
         let zoom = self.auto_zoom();
         if let Some(doc) = &mut self.doc {
             doc.zoom = zoom;
-            if let Ok(v) = std::env::var("DBG") {
-                let first = self.scroll_to(Vector::ZERO);
-                return match v.as_str() {
-                    "goto" => Task::batch([first, Task::done(Message::GoTo(9))]),
-                    _ => Task::batch([first, Task::done(Message::GoTo(9)), Task::done(Message::RotateCounterclockwise)]),
-                };
-            }
         }
         self.scroll_to(Vector::ZERO)
     }
@@ -488,8 +559,8 @@ impl App {
         fit.clamp(MIN_ZOOM, 1.25)
     }
 
-    /// Changes zoom while keeping the document point under `anchor` (or the
-    /// middle of the view) in place.
+    /// Changes zoom while keeping the document point under `anchor` (or, like
+    /// pdf.js, the top left of the view) in place.
     fn zoom(&mut self, zoom: f32, anchor: Option<Point>) -> Task<Message> {
         let view = self.viewport();
         let Some(doc) = &mut self.doc else { return Task::none() };
@@ -499,7 +570,7 @@ impl App {
         if zoom == doc.zoom {
             return Task::none();
         }
-        let anchor = anchor.unwrap_or(Point::new(view.width / 2.0, view.height / 2.0));
+        let anchor = anchor.unwrap_or(Point::ORIGIN);
         let spot = doc.locate(doc.offset.y + anchor.y);
         let fraction_x = (doc.offset.x + anchor.x) / doc.content_size(view).width;
 
@@ -565,16 +636,20 @@ impl App {
         // Render half a screen past each edge so scrolling rarely shows a blank page.
         let (near_start, near_end) = (doc.offset.y - view.height / 2.0, doc.offset.y + 1.5 * view.height);
         let (view_start, view_end) = (doc.offset.y, doc.offset.y + view.height);
+        // Like pdf.js: stay on the current page while all of it shows, otherwise
+        // pick the page with the biggest share showing (the first one on ties).
         let mut most_visible = (0.0, doc.current);
+        let mut keep_current = false;
         let mut wanted = HashMap::new();
         let mut tasks = Vec::new();
 
         for (index, top) in tops.into_iter().enumerate() {
             let size = doc.page_size(index);
             let bottom = top + size.height;
-            let visible = bottom.min(view_end) - top.max(view_start);
-            if visible > most_visible.0 {
-                most_visible = (visible, index);
+            let shown = (bottom.min(view_end) - top.max(view_start)) / size.height;
+            keep_current |= index == doc.current && shown > 0.99;
+            if shown > most_visible.0 {
+                most_visible = (shown, index);
             }
             let page = &mut doc.pages[index];
             if bottom < near_start || top > near_end {
@@ -600,7 +675,9 @@ impl App {
             }));
         }
 
-        doc.current = most_visible.1;
+        if !keep_current {
+            doc.current = most_visible.1;
+        }
         worker.set_wanted(wanted);
         Task::batch(tasks)
     }
