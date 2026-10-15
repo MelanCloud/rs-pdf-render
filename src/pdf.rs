@@ -31,6 +31,16 @@ pub enum Target {
     Web(String),
 }
 
+/// How a page bitmap is rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bitmap {
+    pub width: u32,
+    /// Subpixel (ClearType-style) text, like Acrobat's default on Windows.
+    /// Only for unrotated pages: the subpixel colors are laid out for
+    /// upright text, and the app turns rotated pages after rendering.
+    pub subpixel: bool,
+}
+
 /// A rendered page and its links.
 pub type Rendered = (image::Handle, Vec<Link>);
 
@@ -65,7 +75,7 @@ pub struct Heading {
 
 enum Request {
     Open(PathBuf, Option<String>, oneshot::Sender<Result<DocInfo, OpenError>>),
-    Render(usize, u32, oneshot::Sender<Option<Rendered>>),
+    Render(usize, Bitmap, oneshot::Sender<Option<Rendered>>),
     #[cfg(not(windows))]
     Export(Vec<(usize, Stroke)>, oneshot::Sender<Result<Vec<u8>, String>>),
     Scan(std::ops::Range<usize>, oneshot::Sender<Vec<Heading>>),
@@ -77,9 +87,9 @@ enum Request {
 #[derive(Clone)]
 pub struct Worker {
     tx: mpsc::UnboundedSender<Request>,
-    /// Page index -> bitmap width the UI still wants. Renders for anything else
-    /// (scrolled away, zoom changed since) are skipped.
-    wanted: Arc<Mutex<HashMap<usize, u32>>>,
+    /// Page index -> bitmap the UI still wants. Renders for anything else
+    /// (scrolled away, zoom or rotation changed since) are skipped.
+    wanted: Arc<Mutex<HashMap<usize, Bitmap>>>,
 }
 
 impl Worker {
@@ -95,7 +105,7 @@ impl Worker {
         Ok(Self { tx, wanted })
     }
 
-    pub fn set_wanted(&self, wanted: HashMap<usize, u32>) {
+    pub fn set_wanted(&self, wanted: HashMap<usize, Bitmap>) {
         *self.wanted.lock().unwrap() = wanted;
     }
 
@@ -105,9 +115,9 @@ impl Worker {
         rx.await.unwrap_or_else(|_| Err(OpenError::Failed("PDF engine stopped".into())))
     }
 
-    pub async fn render(self, page: usize, width: u32) -> Option<Rendered> {
+    pub async fn render(self, page: usize, bitmap: Bitmap) -> Option<Rendered> {
         let (reply, rx) = oneshot::channel();
-        let _ = self.tx.send(Request::Render(page, width, reply));
+        let _ = self.tx.send(Request::Render(page, bitmap, reply));
         rx.await.ok().flatten()
     }
 
@@ -159,7 +169,7 @@ fn bind() -> Result<Box<dyn PdfiumLibraryBindings>, String> {
 fn run(
     pdfium: Pdfium,
     mut rx: mpsc::UnboundedReceiver<Request>,
-    wanted: Arc<Mutex<HashMap<usize, u32>>>,
+    wanted: Arc<Mutex<HashMap<usize, Bitmap>>>,
 ) {
     // The document on screen, with the password that unlocked it.
     let mut open: Option<(PathBuf, Option<String>, PdfDocument)> = None;
@@ -190,12 +200,12 @@ fn run(
                     });
                 let _ = reply.send(result);
             }
-            Request::Render(index, width, reply) => {
-                let still_wanted = wanted.lock().unwrap().get(&index) == Some(&width);
+            Request::Render(index, bitmap, reply) => {
+                let still_wanted = wanted.lock().unwrap().get(&index) == Some(&bitmap);
                 let image = open
                     .as_ref()
                     .filter(|_| still_wanted)
-                    .and_then(|(_, _, doc)| render(doc, index, width));
+                    .and_then(|(_, _, doc)| render(doc, index, bitmap));
                 let _ = reply.send(image);
             }
             Request::Scan(pages, reply) => {
@@ -417,10 +427,13 @@ pub fn merge(outline: &[OutlineEntry], headings: Vec<Heading>) -> Vec<OutlineEnt
     merged
 }
 
-fn render(doc: &PdfDocument, index: usize, width: u32) -> Option<Rendered> {
+fn render(doc: &PdfDocument, index: usize, bitmap: Bitmap) -> Option<Rendered> {
     let page = doc.pages().get(index as PdfPageIndex).ok()?;
     let config = PdfRenderConfig::new()
-        .set_target_width(width as Pixels)
+        .set_target_width(bitmap.width as Pixels)
+        .use_lcd_text_rendering(bitmap.subpixel)
+        // PDFium only draws subpixel text on opaque bitmaps.
+        .set_format(PdfBitmapFormat::BGRx)
         .render_form_data(true);
     let bitmap = page.render_with_config(&config).ok()?;
     let image = image::Handle::from_rgba(bitmap.width() as u32, bitmap.height() as u32, bitmap.as_rgba_bytes());

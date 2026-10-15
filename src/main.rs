@@ -9,7 +9,7 @@ mod system;
 mod ui;
 
 use ink::Stroke;
-use pdf::{Heading, Link, OpenError, OutlineEntry, Target, Worker};
+use pdf::{Bitmap, Heading, Link, OpenError, OutlineEntry, Target, Worker};
 use settings::{Position, Settings, ThemeChoice, Zoom};
 
 use iced::time::Instant;
@@ -180,8 +180,8 @@ pub struct Glide {
 pub struct Page {
     /// Unrotated size in PDF points.
     size: Size,
-    image: Option<(u32, image::Handle)>,
-    pending: Option<u32>,
+    image: Option<(Bitmap, image::Handle)>,
+    pending: Option<Bitmap>,
     strokes: Vec<Stroke>,
     /// Kept when the bitmap is dropped; they're small.
     links: Vec<Link>,
@@ -211,7 +211,7 @@ pub enum Message {
     CancelPassword,
     /// Escape, even when a text box takes it.
     Escape,
-    Rendered { doc: u64, page: usize, width: u32, rendered: Option<pdf::Rendered> },
+    Rendered { doc: u64, page: usize, bitmap: Bitmap, rendered: Option<pdf::Rendered> },
 
     Scrolled(scrollable::Viewport),
     ZoomIn,
@@ -459,17 +459,17 @@ impl App {
                     self.drawing = false;
                 }
             }
-            Message::Rendered { doc, page, width, rendered } => {
+            Message::Rendered { doc, page, bitmap, rendered } => {
                 if let Some(page) = self
                     .doc
                     .as_mut()
                     .filter(|d| d.id == doc)
                     .and_then(|d| d.pages.get_mut(page))
-                    .filter(|p| p.pending == Some(width))
+                    .filter(|p| p.pending == Some(bitmap))
                 {
                     page.pending = None;
                     if let Some((image, links)) = rendered {
-                        page.image = Some((width, image));
+                        page.image = Some((bitmap, image));
                         page.links = links;
                     }
                 }
@@ -1028,14 +1028,15 @@ impl App {
                 width *= (MAX_BITMAP_PIXELS / pixels).sqrt();
             }
             let width = width.round().max(1.0) as u32;
-            wanted.insert(index, width);
-            if page.image.as_ref().is_some_and(|(w, _)| *w == width) || page.pending == Some(width) {
+            let bitmap = Bitmap { width, subpixel: doc.rotation == 0 };
+            wanted.insert(index, bitmap);
+            if page.image.as_ref().is_some_and(|(have, _)| *have == bitmap) || page.pending == Some(bitmap) {
                 continue;
             }
-            page.pending = Some(width);
+            page.pending = Some(bitmap);
             let id = doc.id;
-            tasks.push(Task::perform(worker.clone().render(index, width), move |rendered| {
-                Message::Rendered { doc: id, page: index, width, rendered }
+            tasks.push(Task::perform(worker.clone().render(index, bitmap), move |rendered| {
+                Message::Rendered { doc: id, page: index, bitmap, rendered }
             }));
         }
 
