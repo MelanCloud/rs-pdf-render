@@ -51,7 +51,9 @@ there are no ready-made packages for them yet.
   Page width and 100%.
 - **Pages:** a box to type the page number next to the page count, and
   rotate counterclockwise.
-- **Outline:** the document's table of contents in a sidebar.
+- **Outline:** the document's table of contents in a sidebar. Optionally,
+  the app scans the text for numbered subsections like "2.6.4" and adds them,
+  for books whose own outline stops at the sections.
 - **Links:** page links jump to the right spot, and web and email links open
   in your browser. Back and Forward return you after following a link or an
   outline entry.
@@ -63,8 +65,9 @@ there are no ready-made packages for them yet.
 - **Password-protected PDFs:** it asks for the password, like Firefox.
 - **Light, dark or system theme.**
 - **Settings** (the gear button): smooth scrolling, sliding or instant
-  toolbars, always-visible toolbars, the zoom for new files, and the scroll
-  speed per wheel notch. Smooth scrolling and sliding toolbars start off if
+  toolbars, always-visible toolbars, the zoom for new files, the scroll
+  speed per wheel notch, and scanning for numbered subsections (off by
+  default; what it finds is forgotten when the file closes). Smooth scrolling and sliding toolbars start off if
   Windows' "Animation effects" are off.
 
 ## Keyboard and mouse

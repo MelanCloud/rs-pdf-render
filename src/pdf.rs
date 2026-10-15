@@ -46,7 +46,21 @@ pub enum OpenError {
 pub struct OutlineEntry {
     pub title: String,
     pub page: Option<usize>,
+    /// How far down the page to show, from 0 to 1, for scanned headings.
+    pub top: Option<f32>,
     pub depth: usize,
+    /// Found by scanning the text rather than read from the file's outline.
+    pub scanned: bool,
+}
+
+/// A numbered heading found in a page's text, like "2.6.4 Zero–One Matrices".
+#[derive(Debug, Clone)]
+pub struct Heading {
+    pub number: Vec<u16>,
+    pub title: String,
+    pub page: usize,
+    /// How far down the page the heading starts, from 0 to 1.
+    pub top: f32,
 }
 
 enum Request {
@@ -54,6 +68,7 @@ enum Request {
     Render(usize, u32, oneshot::Sender<Option<Rendered>>),
     #[cfg(not(windows))]
     Export(Vec<(usize, Stroke)>, oneshot::Sender<Result<Vec<u8>, String>>),
+    Scan(std::ops::Range<usize>, oneshot::Sender<Vec<Heading>>),
     #[cfg(windows)]
     Print(Vec<(usize, Stroke)>, crate::print::Job, oneshot::Sender<Result<(), String>>),
 }
@@ -94,6 +109,13 @@ impl Worker {
         let (reply, rx) = oneshot::channel();
         let _ = self.tx.send(Request::Render(page, width, reply));
         rx.await.ok().flatten()
+    }
+
+    /// Numbered headings on some pages of the open document.
+    pub async fn scan(self, pages: std::ops::Range<usize>) -> Vec<Heading> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(Request::Scan(pages, reply));
+        rx.await.unwrap_or_default()
     }
 
     /// The open document's bytes with the drawings burned in.
@@ -141,6 +163,10 @@ fn run(
 ) {
     // The document on screen, with the password that unlocked it.
     let mut open: Option<(PathBuf, Option<String>, PdfDocument)> = None;
+    // Scans read their own copy of the document, closed when the scan ends,
+    // because PDFium keeps everything it parses until its document closes
+    // (about 40 MB for a 1000-page book).
+    let mut scanning: Option<PdfDocument> = None;
 
     while let Some(request) = rx.blocking_recv() {
         match request {
@@ -158,6 +184,7 @@ fn run(
                     })
                     .map(|doc| {
                         let info = describe(&doc);
+                        scanning = None;
                         open = Some((path, password, doc));
                         info
                     });
@@ -170,6 +197,26 @@ fn run(
                     .filter(|_| still_wanted)
                     .and_then(|(_, _, doc)| render(doc, index, width));
                 let _ = reply.send(image);
+            }
+            Request::Scan(pages, reply) => {
+                if pages.start == 0 {
+                    scanning = open
+                        .as_ref()
+                        .and_then(|(path, password, _)| pdfium.load_pdf_from_file(path, password.as_deref()).ok());
+                }
+                let Some(doc) = &scanning else {
+                    let _ = reply.send(Vec::new());
+                    continue;
+                };
+                let last = pages.end >= doc.pages().len() as usize;
+                let found = pages
+                    .filter_map(|index| Some(headings(index, &doc.pages().get(index as PdfPageIndex).ok()?)))
+                    .flatten()
+                    .collect();
+                if last {
+                    scanning = None;
+                }
+                let _ = reply.send(found);
             }
             #[cfg(not(windows))]
             Request::Export(strokes, reply) => {
@@ -231,13 +278,138 @@ fn collect_outline(first: PdfBookmark, depth: usize, out: &mut Vec<OutlineEntry>
         out.push(OutlineEntry {
             title: bookmark.title().unwrap_or_default().trim().to_string(),
             page,
+            top: None,
             depth,
+            scanned: false,
         });
         if let Some(child) = bookmark.first_child() {
             collect_outline(child, depth + 1, out);
         }
         next = bookmark.next_sibling();
     }
+}
+
+/// Finds numbered headings in a page's text: lines that start with a number
+/// of two or more parts and a title, set bolder or larger than the page's body
+/// text (which leaves out running headers and plain mentions).
+fn headings(index: usize, page: &PdfPage) -> Vec<Heading> {
+    let Ok(text) = page.text() else { return Vec::new() };
+    let chars = text.chars();
+    // Each line's characters (with their index on the page) and largest size.
+    let mut lines: Vec<(Vec<(char, usize)>, f32)> = vec![(Vec::new(), 0.0)];
+    let mut sizes = Vec::new();
+    for (at, char) in chars.iter().enumerate() {
+        let Some(c) = char.unicode_char() else { continue };
+        let Some(line) = lines.last_mut() else { continue };
+        if c == '\n' || c == '\r' {
+            if !line.0.is_empty() {
+                lines.push((Vec::new(), 0.0));
+            }
+            continue;
+        }
+        if !c.is_whitespace() {
+            let size = char.scaled_font_size().value;
+            sizes.push(size);
+            line.1 = line.1.max(size);
+        }
+        line.0.push((c, at));
+    }
+    if sizes.is_empty() {
+        return Vec::new();
+    }
+    sizes.sort_by(f32::total_cmp);
+    let body = sizes[sizes.len() / 2];
+
+    lines
+        .iter()
+        .filter_map(|(line, size)| {
+            let text: String = line.iter().map(|(c, _)| c).collect();
+            let (number, title) = numbered(&text)?;
+            let first = chars.get(line[title].1 as PdfPageTextCharIndex).ok()?;
+            let name = first.font_name().to_lowercase();
+            let bold = matches!(
+                first.font_weight(),
+                Some(PdfFontWeight::Weight600 | PdfFontWeight::Weight700Bold | PdfFontWeight::Weight800 | PdfFontWeight::Weight900)
+            ) || ["bold", "black", "heavy", "semibold", "demi"].iter().any(|weight| name.contains(weight));
+            if !bold && *size < body * 1.1 {
+                return None;
+            }
+            let bounds = first.loose_bounds().ok()?;
+            let (_, top) = fraction(page, bounds.left(), bounds.top())?;
+            // A little room above, so the heading isn't flush with the edge.
+            let top = (top - 0.015).clamp(0.0, 1.0);
+            let title = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            Some(Heading { number, title, page: index, top })
+        })
+        .collect()
+}
+
+/// Splits "2.6.4 Zero–One Matrices" into [2, 6, 4] and where the title starts
+/// (in characters). Needs two or more parts of up to three digits, then a
+/// capitalized title of a sensible length that isn't a contents line (dot
+/// leaders or a page number at the end).
+fn numbered(line: &str) -> Option<(Vec<u16>, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    let start = chars.iter().take_while(|c| c.is_whitespace()).count();
+    let end = start + chars[start..].iter().take_while(|c| c.is_ascii_digit() || **c == '.').count();
+    let number: String = chars[start..end].iter().collect();
+    let parts = number
+        .trim_end_matches('.')
+        .split('.')
+        .map(|part| if (1..=3).contains(&part.len()) { part.parse().ok() } else { None })
+        .collect::<Option<Vec<u16>>>()?;
+    let gap = chars[end..].iter().take_while(|c| c.is_whitespace()).count();
+    let title = end + gap;
+    let rest: String = chars[title..].iter().collect();
+    let rest = rest.trim_end();
+    let fits = parts.len() >= 2
+        && gap > 0
+        && rest.chars().next().is_some_and(char::is_uppercase)
+        && (2..=80).contains(&rest.chars().count())
+        && !rest.contains("..")
+        && !rest.ends_with(|c: char| c.is_ascii_digit());
+    fits.then_some((parts, title))
+}
+
+/// The number an outline title starts with, like [2, 6] for "2.6 Matrices".
+fn leading_number(title: &str) -> Option<Vec<u16>> {
+    let (number, _) = title.split_once(' ')?;
+    number.trim_end_matches('.').split('.').map(|part| part.parse().ok()).collect()
+}
+
+/// Adds scanned headings to an outline. Each goes under the entry whose
+/// number is its closest prefix ("2.6.4" under "2.6", else "2"), after that
+/// entry's other children. Numbers already in the outline are skipped, so
+/// running headers and repeats only count once.
+pub fn merge(outline: &[OutlineEntry], headings: Vec<Heading>) -> Vec<OutlineEntry> {
+    let mut merged = outline.to_vec();
+    let mut numbers: Vec<Option<Vec<u16>>> = merged.iter().map(|entry| leading_number(&entry.title)).collect();
+    for heading in headings {
+        if numbers.iter().any(|number| number.as_ref() == Some(&heading.number)) {
+            continue;
+        }
+        let parent = (1..heading.number.len())
+            .rev()
+            .find_map(|len| numbers.iter().rposition(|number| number.as_deref() == Some(&heading.number[..len])));
+        let (at, depth) = match parent {
+            Some(parent) => {
+                let depth = merged[parent].depth;
+                let end = (parent + 1..merged.len()).find(|&i| merged[i].depth <= depth).unwrap_or(merged.len());
+                (end, depth + 1)
+            }
+            None => (merged.len(), 0),
+        };
+        let entry = OutlineEntry {
+            title: heading.title,
+            page: Some(heading.page),
+            top: Some(heading.top),
+            depth,
+            scanned: true,
+        };
+        merged.insert(at, entry);
+        numbers.insert(at, Some(heading.number));
+    }
+    merged
 }
 
 fn render(doc: &PdfDocument, index: usize, width: u32) -> Option<Rendered> {

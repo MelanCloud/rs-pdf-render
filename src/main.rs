@@ -9,7 +9,7 @@ mod system;
 mod ui;
 
 use ink::Stroke;
-use pdf::{Link, OpenError, OutlineEntry, Target, Worker};
+use pdf::{Heading, Link, OpenError, OutlineEntry, Target, Worker};
 use settings::{Position, Settings, ThemeChoice, Zoom};
 
 use iced::time::Instant;
@@ -35,6 +35,8 @@ const TOOLBAR_HEIGHT: f32 = 40.0;
 const REVEAL_DISTANCE: f32 = 12.0;
 /// ...and goes away once the cursor is this far below the toolbar.
 const HIDE_DISTANCE: f32 = 40.0;
+/// Pages scanned for headings per request, so page renders can go in between.
+const SCAN_BATCH: usize = 8;
 /// How long a smooth scroll takes to settle.
 const GLIDE: Duration = Duration::from_millis(160);
 const DOCUMENT: &str = "document";
@@ -124,7 +126,12 @@ pub struct Document {
     path: PathBuf,
     name: String,
     pages: Vec<Page>,
+    /// What the sidebar shows: the file's outline, plus scanned headings.
     outline: Vec<OutlineEntry>,
+    /// The file's own outline, to go back to when scanning is turned off.
+    file_outline: Vec<OutlineEntry>,
+    /// A scan for numbered headings in progress.
+    scan: Option<Scan>,
     /// Outline entries whose children are hidden.
     collapsed: HashSet<usize>,
     zoom: f32,
@@ -147,6 +154,14 @@ pub struct Document {
     /// and where Back left from, for Forward.
     back: Vec<Spot>,
     forward: Vec<Spot>,
+}
+
+/// How far a scan for numbered headings has got.
+#[derive(Default)]
+pub struct Scan {
+    /// The next page to scan.
+    next: usize,
+    found: Vec<Heading>,
 }
 
 /// A smooth scroll in progress.
@@ -203,8 +218,10 @@ pub enum Message {
     WheelScroll(Vector),
     PageInput(String),
     PageSubmit,
-    /// Go to a page from the outline, remembering the way back.
-    Jump(usize),
+    /// Go to a page (and a spot on it) from the outline, remembering the way back.
+    Jump(usize, Option<f32>),
+    /// Headings found on pages up to the given one, for a document id.
+    Scanned(u64, usize, Vec<Heading>),
     FollowLink(Target),
     Back,
     Forward,
@@ -232,6 +249,7 @@ pub enum Message {
     SetAlwaysShowToolbars(bool),
     SetDefaultZoom(Zoom),
     SetScrollSpeed(f32),
+    SetScanSubsections(bool),
     /// The scroll speed slider was let go, so its value is final.
     SaveSettings,
     SystemTheme(iced::theme::Mode),
@@ -498,7 +516,20 @@ impl App {
                     }
                 }
             }
-            Message::Jump(page) => return self.jump(page, None),
+            Message::Jump(page, top) => return self.jump(page, top),
+            Message::Scanned(id, end, found) => {
+                let Some(doc) = self.doc.as_mut().filter(|doc| doc.id == id) else { return Task::none() };
+                let Some(scan) = &mut doc.scan else { return Task::none() };
+                scan.found.extend(found);
+                scan.next = end;
+                if end < doc.pages.len() {
+                    return self.scan_next();
+                }
+                let found = doc.scan.take().map(|scan| scan.found).unwrap_or_default();
+                let outline = pdf::merge(&doc.file_outline, found);
+                doc.collapsed = keep_collapsed(&doc.outline, &doc.collapsed, &outline);
+                doc.outline = outline;
+            }
             Message::FollowLink(Target::Page(page, top)) => return self.jump(page, top),
             Message::FollowLink(Target::Web(url)) => system::open_link(&url),
             Message::Back => return self.back(false),
@@ -620,6 +651,17 @@ impl App {
                 self.settings.save();
             }
             Message::SetScrollSpeed(speed) => self.settings.scroll_speed = speed,
+            Message::SetScanSubsections(on) => {
+                self.settings.scan_subsections = on;
+                self.settings.save();
+                let Some(doc) = &mut self.doc else { return Task::none() };
+                if on {
+                    return self.start_scan();
+                }
+                doc.scan = None;
+                doc.collapsed = keep_collapsed(&doc.outline, &doc.collapsed, &doc.file_outline);
+                doc.outline = doc.file_outline.clone();
+            }
             Message::SaveSettings => self.settings.save(),
             Message::SystemTheme(mode) => self.system_dark = mode != iced::theme::Mode::Light,
         }
@@ -707,9 +749,7 @@ impl App {
         self.error = None;
         self.drawing = false;
         // Like pdf.js, start with only the top level of the outline showing.
-        let collapsed = (0..info.outline.len())
-            .filter(|&i| info.outline.get(i + 1).is_some_and(|next| next.depth > info.outline[i].depth))
-            .collect();
+        let collapsed = (0..info.outline.len()).filter(|&i| has_children(&info.outline, i)).collect();
         let position = settings::recall(&path).filter(|position| position.page < info.pages.len());
         self.doc = Some(Document {
             id: self.next_id,
@@ -728,7 +768,9 @@ impl App {
                     links: Vec::new(),
                 })
                 .collect(),
+            file_outline: info.outline.clone(),
             outline: info.outline,
+            scan: None,
             collapsed,
             zoom: position.map_or(1.0, |position| position.zoom),
             fit: position.map_or(Some(self.settings.default_zoom), |position| position.fit),
@@ -750,10 +792,30 @@ impl App {
                 doc.zoom = zoom;
             }
         }
-        match position {
+        let show = match position {
             Some(position) => self.go_to_spot((position.page, position.fraction)),
             None => self.scroll_to(Vector::ZERO),
+        };
+        let scan = if self.settings.scan_subsections { self.start_scan() } else { Task::none() };
+        Task::batch([show, scan])
+    }
+
+    /// Scans the open document for numbered headings, a few pages at a time.
+    fn start_scan(&mut self) -> Task<Message> {
+        let Some(doc) = &mut self.doc else { return Task::none() };
+        if doc.scan.is_some() || doc.outline.iter().any(|entry| entry.scanned) {
+            return Task::none();
         }
+        doc.scan = Some(Scan::default());
+        self.scan_next()
+    }
+
+    fn scan_next(&self) -> Task<Message> {
+        let (Some(doc), Ok(worker)) = (&self.doc, &self.pdf) else { return Task::none() };
+        let Some(scan) = &doc.scan else { return Task::none() };
+        let end = (scan.next + SCAN_BATCH).min(doc.pages.len());
+        let id = doc.id;
+        Task::perform(worker.clone().scan(scan.next..end), move |found| Message::Scanned(id, end, found))
     }
 
     /// Saves where the open file was left, for next time.
@@ -1003,4 +1065,31 @@ impl Document {
     fn y_of(&self, (index, fraction): (usize, f32)) -> f32 {
         self.tops()[index] + fraction * self.page_size(index).height
     }
+}
+
+fn has_children(outline: &[OutlineEntry], index: usize) -> bool {
+    outline.get(index + 1).is_some_and(|next| next.depth > outline[index].depth)
+}
+
+/// Which entries of `new` start folded when the outline changes from `old`:
+/// file entries keep how the user left them, and entries that only now have
+/// children (scanned subsections under a section) start folded, like pdf.js.
+fn keep_collapsed(old: &[OutlineEntry], collapsed: &HashSet<usize>, new: &[OutlineEntry]) -> HashSet<usize> {
+    let old_index: Vec<usize> = (0..old.len()).filter(|&i| !old[i].scanned).collect();
+    let mut file_entry = 0;
+    let mut result = HashSet::new();
+    for index in 0..new.len() {
+        let folded = if new[index].scanned {
+            has_children(new, index)
+        } else {
+            let before = old_index.get(file_entry).copied();
+            file_entry += 1;
+            has_children(new, index)
+                && before.is_none_or(|before| collapsed.contains(&before) || !has_children(old, before))
+        };
+        if folded {
+            result.insert(index);
+        }
+    }
+    result
 }

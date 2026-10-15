@@ -72,6 +72,9 @@ pub struct Settings {
     pub default_zoom: Zoom,
     /// How far one mouse wheel notch scrolls, in pixels.
     pub scroll_speed: f32,
+    /// Scan each opened file's text for numbered headings ("2.6.4 ...") and
+    /// add them to the outline. What's found isn't kept after the file closes.
+    pub scan_subsections: bool,
 }
 
 impl Settings {
@@ -86,6 +89,7 @@ impl Settings {
             always_show_toolbars: false,
             default_zoom: Zoom::Automatic,
             scroll_speed: 60.0,
+            scan_subsections: false,
         };
         let Some(text) = file("settings.txt").and_then(|path| std::fs::read_to_string(path).ok()) else {
             return settings;
@@ -105,6 +109,7 @@ impl Settings {
                 "animate_toolbars" => settings.animate_toolbars = on,
                 "always_show_toolbars" => settings.always_show_toolbars = on,
                 "default_zoom" => settings.default_zoom = Zoom::from_key(value).unwrap_or(Zoom::Automatic),
+                "scan_subsections" => settings.scan_subsections = on,
                 "scroll_speed" => {
                     if let Ok(speed) = value.parse::<f32>() {
                         settings.scroll_speed = speed.clamp(*SCROLL_SPEEDS.start(), *SCROLL_SPEEDS.end());
@@ -121,13 +126,14 @@ impl Settings {
     pub fn save(&self) {
         let switch = |on: bool| if on { "on" } else { "off" };
         let text = format!(
-            "theme={}\nsmooth_scrolling={}\nanimate_toolbars={}\nalways_show_toolbars={}\ndefault_zoom={}\nscroll_speed={}\n",
+            "theme={}\nsmooth_scrolling={}\nanimate_toolbars={}\nalways_show_toolbars={}\ndefault_zoom={}\nscroll_speed={}\nscan_subsections={}\n",
             self.theme.label().to_lowercase(),
             switch(self.smooth_scrolling),
             switch(self.animate_toolbars),
             switch(self.always_show_toolbars),
             self.default_zoom.key(),
             self.scroll_speed,
+            switch(self.scan_subsections),
         );
         write("settings.txt", &text);
     }

@@ -423,7 +423,7 @@ fn outline(doc: &Document, top: f32) -> Element<'_, Message> {
             space().width(20).into()
         };
         let title = button(text(&entry.title).size(13).wrapping(text::Wrapping::WordOrGlyph))
-            .on_press_maybe(entry.page.map(Message::Jump))
+            .on_press_maybe(entry.page.map(|page| Message::Jump(page, entry.top)))
             .width(Fill)
             .padding([4, 6])
             .style(|theme, status| flat(theme, status, false));
@@ -435,14 +435,19 @@ fn outline(doc: &Document, top: f32) -> Element<'_, Message> {
         );
     }
 
+    let scanning = doc.scan.as_ref().map(|scan| {
+        text!("Scanning for numbered subsections… {} of {}", scan.next, doc.pages.len()).size(12).style(muted)
+    });
     let body: Element<_> = if doc.outline.is_empty() {
-        container(text("No outline in this document.").size(13).style(muted)).padding(12).into()
+        let empty = scanning.unwrap_or_else(|| text("No outline in this document.").size(13).style(muted));
+        container(empty).padding(12).into()
     } else {
-        scrollable(list.padding(6))
-            .direction(Direction::Vertical(thin_scrollbar()))
-            .style(scrollbars)
-            .height(Fill)
-            .into()
+        let list = scrollable(list.padding(6)).direction(Direction::Vertical(thin_scrollbar())).style(scrollbars);
+        let mut body = column![];
+        if let Some(scanning) = scanning {
+            body = body.push(container(scanning).padding([6, 12]));
+        }
+        body.push(list.height(Fill)).into()
     };
 
     container(body)
@@ -546,6 +551,7 @@ fn settings(app: &App) -> Element<'_, Message> {
         switch(app.settings.smooth_scrolling, "Smooth scrolling", Message::SetSmoothScrolling),
         switch(app.settings.animate_toolbars, "Animate toolbars", Message::SetAnimateToolbars),
         switch(app.settings.always_show_toolbars, "Always show toolbars", Message::SetAlwaysShowToolbars),
+        switch(app.settings.scan_subsections, "Scan for numbered subsections", Message::SetScanSubsections),
         text("Zoom for new files").size(12).style(muted),
         zooms,
         text("Scroll speed per wheel notch").size(12).style(muted),
