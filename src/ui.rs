@@ -98,14 +98,12 @@ pub fn view(app: &App) -> Element<'_, Message> {
         layers = layers.push(password(locked));
     }
     if let Some(menu) = app.menu {
-        // Clicking anywhere else closes the menu, like a browser menu.
-        layers = layers.push(mouse_area(space().width(Fill).height(Fill)).on_press(Message::ToggleMenu(menu)));
         let dropdown = match menu {
             Menu::File => file_menu(app),
             Menu::Settings => settings(app),
         };
         layers = layers.push(
-            container(opaque(dropdown))
+            container(mouse_area(opaque(dropdown)).on_enter(Message::OverMenu(true)).on_exit(Message::OverMenu(false)))
                 .width(Fill)
                 .align_x(iced::Right)
                 .padding(iced::Padding::new(6.0).top(reveal + 6.0)),

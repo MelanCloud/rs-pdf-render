@@ -379,8 +379,9 @@ fn leading_number(title: &str) -> Option<Vec<u16>> {
 
 /// Adds scanned headings to an outline. Each goes under the entry whose
 /// number is its closest prefix ("2.6.4" under "2.6", else "2"), after that
-/// entry's other children. Numbers already in the outline are skipped, so
-/// running headers and repeats only count once.
+/// entry's other children, or else among the top-level entries by page.
+/// Numbers already in the outline are skipped, so running headers and
+/// repeats only count once.
 pub fn merge(outline: &[OutlineEntry], headings: Vec<Heading>) -> Vec<OutlineEntry> {
     let mut merged = outline.to_vec();
     let mut numbers: Vec<Option<Vec<u16>>> = merged.iter().map(|entry| leading_number(&entry.title)).collect();
@@ -397,7 +398,11 @@ pub fn merge(outline: &[OutlineEntry], headings: Vec<Heading>) -> Vec<OutlineEnt
                 let end = (parent + 1..merged.len()).find(|&i| merged[i].depth <= depth).unwrap_or(merged.len());
                 (end, depth + 1)
             }
-            None => (merged.len(), 0),
+            // No numbered parent: a top-level entry, in page order.
+            None => {
+                let after = |entry: &OutlineEntry| entry.depth == 0 && entry.page.is_some_and(|page| page > heading.page);
+                (merged.iter().position(after).unwrap_or(merged.len()), 0)
+            }
         };
         let entry = OutlineEntry {
             title: heading.title,

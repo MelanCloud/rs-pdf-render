@@ -97,6 +97,11 @@ pub struct App {
     locked: Option<Locked>,
     settings: Settings,
     menu: Option<Menu>,
+    /// The pointer is over the open dropdown, so a click there keeps it open.
+    over_menu: bool,
+    /// The dropdown the last mouse press closed, so that clicking its own
+    /// button closes it instead of opening it again on release.
+    closed_by_press: Option<Menu>,
     /// Whether the system uses a dark theme, for the "System" choice.
     system_dark: bool,
 }
@@ -243,6 +248,10 @@ pub enum Message {
     DismissError,
 
     ToggleMenu(Menu),
+    /// The pointer went onto or off the open dropdown.
+    OverMenu(bool),
+    /// Any mouse press anywhere, even one a widget handles.
+    Pressed,
     SetTheme(ThemeChoice),
     SetSmoothScrolling(bool),
     SetAnimateToolbars(bool),
@@ -275,6 +284,8 @@ impl App {
             locked: None,
             settings: Settings::load(),
             menu: None,
+            over_menu: false,
+            closed_by_press: None,
             system_dark: true,
         };
         let ready = window::oldest().and_then(|id| {
@@ -322,6 +333,7 @@ impl App {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Forward)) => Some(Message::Forward),
             Event::Mouse(mouse::Event::CursorMoved { position }) => Some(Message::CursorMoved(position)),
             Event::Mouse(mouse::Event::CursorLeft) => Some(Message::CursorLeft),
+            Event::Mouse(mouse::Event::ButtonPressed(_)) => Some(Message::Pressed),
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key: keyboard::Key::Named(keyboard::key::Named::Escape),
                 ..
@@ -626,8 +638,19 @@ impl App {
             Message::DismissError => self.error = None,
 
             Message::ToggleMenu(menu) => {
-                self.menu = (self.menu != Some(menu)).then_some(menu);
+                let closed_now = self.closed_by_press.take() == Some(menu);
+                self.menu = (self.menu != Some(menu) && !closed_now).then_some(menu);
+                self.over_menu = false;
                 self.show_toolbar(true);
+            }
+            Message::OverMenu(over) => self.over_menu = over,
+            // Like a browser menu: a press outside the dropdown closes it, and
+            // still does whatever it was pressing (open an outline entry...).
+            Message::Pressed => {
+                self.closed_by_press = None;
+                if !self.over_menu {
+                    self.closed_by_press = self.menu.take();
+                }
             }
             Message::SetTheme(theme) => {
                 self.settings.theme = theme;
