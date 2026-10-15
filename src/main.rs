@@ -664,7 +664,7 @@ impl App {
                     .enumerate()
                     .flat_map(|(i, page)| page.strokes.iter().map(move |s| (i, s.clone())))
                     .collect();
-                // Windows asks for a printer first, then the PDFium thread prints.
+                // Windows asks for a printer first, then the MuPDF thread prints.
                 #[cfg(windows)]
                 {
                     let Some(id) = self.window else { return Task::none() };
@@ -1092,7 +1092,7 @@ impl App {
             let capped = pixels > MAX_BITMAP_PIXELS;
             let width = if capped { full_width * (MAX_BITMAP_PIXELS / pixels).sqrt() } else { full_width };
             let width = width.round().max(1.0) as u32;
-            let bitmap = Bitmap { width, subpixel: doc.rotation == 0 };
+            let bitmap = Bitmap { width };
 
             // Zoomed in too far to render the whole page sharp, like pdf.js:
             // render the part in view (plus a quarter screen around it) at
@@ -1107,7 +1107,6 @@ impl App {
                 let y1 = (doc.offset.y + view.height + my - top).min(size.height);
                 (x1 > x0 && y1 > y0).then(|| Detail {
                     page_width: full_width.round() as u32,
-                    subpixel: true,
                     x: (x0 * scale_factor).floor() as u32,
                     y: (y0 * scale_factor).floor() as u32,
                     width: ((x1 - x0) * scale_factor).ceil() as u32,

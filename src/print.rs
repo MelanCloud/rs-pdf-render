@@ -56,21 +56,21 @@ pub fn print(_window: &dyn iced::window::Window, pdf: Vec<u8>) -> Result<(), Str
         .map_err(|e| format!("Couldn't start printing ({e})."))
 }
 
-/// Windows shows its print dialog, then PDFium draws each page straight onto
-/// the printer, so text stays sharp and big documents stay small.
+/// Windows shows its print dialog, then MuPDF draws each page as a picture at
+/// the printer's resolution, so text stays sharp.
 #[cfg(windows)]
 mod windows {
-    use std::ffi::{CStr, c_char, c_int, c_void};
-    use std::ops::RangeInclusive;
-    use windows_sys::Win32::Foundation::{GlobalFree, HMODULE, HWND};
-    use windows_sys::Win32::Graphics::Gdi::{DeleteDC, GetDeviceCaps, HDC, HORZRES, LOGPIXELSX, LOGPIXELSY, VERTRES};
+    use std::ops::{Range, RangeInclusive};
+    use windows_sys::Win32::Foundation::{GlobalFree, HWND};
+    use windows_sys::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteDC, GetDeviceCaps, HDC, HORZRES, LOGPIXELSX,
+        LOGPIXELSY, SRCCOPY, StretchDIBits, VERTRES,
+    };
     use windows_sys::Win32::Storage::Xps::{AbortDoc, DOCINFOW, EndDoc, EndPage, StartDocW, StartPage};
-    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
     use windows_sys::Win32::UI::Controls::Dialogs::{
         CommDlgExtendedError, PD_NOSELECTION, PD_PAGENUMS, PD_RETURNDC, PD_USEDEVMODECOPIESANDCOLLATE, PRINTDLGW,
         PrintDlgW,
     };
-    use windows_sys::w;
 
     /// The printer and pages the user picked.
     pub struct Job {
@@ -138,107 +138,86 @@ mod windows {
         Ok(Some(Job { dc: setup.hDC as usize, pages }))
     }
 
-    /// Prints `pdf` to the job's printer. Must run on the PDFium thread.
-    pub fn print(job: &Job, pdf: &[u8], title: &str) -> Result<(), String> {
-        let pdfium = Pdfium::find().ok_or("Couldn't find PDFium's printing functions.")?;
-        let doc = unsafe { (pdfium.load_document)(pdf.as_ptr().cast(), pdf.len(), std::ptr::null()) };
-        if doc.is_null() {
-            return Err("Couldn't prepare the document for printing.".into());
-        }
+    /// Rows of printer pixels drawn at a time, to keep memory down at
+    /// printer resolutions (a whole letter page at 600 DPI is 134 MB).
+    const BAND: i32 = 512;
+
+    /// Prints the job's pages. `size` gives a page's size in points; `band`
+    /// draws some rows of a page at a size in printer pixels, turned a
+    /// quarter clockwise if asked, as top-down BGRA pixels.
+    pub fn print(
+        job: &Job,
+        title: &str,
+        size: impl Fn(usize) -> Option<(f32, f32)>,
+        mut band: impl FnMut(usize, (i32, i32), bool, Range<i32>) -> Option<Vec<u8>>,
+    ) -> Result<(), String> {
         let dc = job.dc as HDC;
         let title: Vec<u16> = title.encode_utf16().chain([0]).collect();
         let info = DOCINFOW { cbSize: size_of::<DOCINFOW>() as i32, lpszDocName: title.as_ptr(), ..DOCINFOW::default() };
-
-        let result = if unsafe { StartDocW(dc, &info) } <= 0 {
-            Err("The printer didn't accept the document.".to_string())
-        } else {
-            let printed = job.pages.clone().try_for_each(|index| unsafe { pdfium.print_page(doc, index, dc) });
-            match printed {
-                Ok(()) if unsafe { EndDoc(dc) } > 0 => Ok(()),
-                Ok(()) => Err("The printer didn't finish the document.".into()),
-                Err(error) => {
-                    unsafe { AbortDoc(dc) };
-                    Err(error)
-                }
-            }
-        };
-        unsafe { (pdfium.close_document)(doc) };
-        result
-    }
-
-    type Document = *mut c_void;
-    type Page = *mut c_void;
-
-    /// The few PDFium functions printing needs. pdfium-render doesn't offer
-    /// drawing onto a printer, so they're looked up in the copy of PDFium it
-    /// already loaded.
-    struct Pdfium {
-        load_document: unsafe extern "system" fn(*const c_void, usize, *const c_char) -> Document,
-        close_document: unsafe extern "system" fn(Document),
-        load_page: unsafe extern "system" fn(Document, c_int) -> Page,
-        close_page: unsafe extern "system" fn(Page),
-        /// Page sizes in points, after the page's own rotation.
-        page_width: unsafe extern "system" fn(Page) -> f32,
-        page_height: unsafe extern "system" fn(Page) -> f32,
-        render: unsafe extern "system" fn(HDC, Page, c_int, c_int, c_int, c_int, c_int, c_int),
-    }
-
-    impl Pdfium {
-        fn find() -> Option<Self> {
-            /// Looks up `name`, which has to be a function of type `F`.
-            unsafe fn function<F>(library: HMODULE, name: &CStr) -> Option<F> {
-                let found = unsafe { GetProcAddress(library, name.as_ptr().cast()) }?;
-                Some(unsafe { std::mem::transmute_copy(&found) })
-            }
-
-            let library = unsafe { GetModuleHandleW(w!("pdfium.dll")) };
-            if library.is_null() {
-                return None;
-            }
-            // SAFETY: the types above match PDFium's headers.
-            unsafe {
-                Some(Self {
-                    load_document: function(library, c"FPDF_LoadMemDocument64")?,
-                    close_document: function(library, c"FPDF_CloseDocument")?,
-                    load_page: function(library, c"FPDF_LoadPage")?,
-                    close_page: function(library, c"FPDF_ClosePage")?,
-                    page_width: function(library, c"FPDF_GetPageWidthF")?,
-                    page_height: function(library, c"FPDF_GetPageHeightF")?,
-                    render: function(library, c"FPDF_RenderPage")?,
-                })
+        if unsafe { StartDocW(dc, &info) } <= 0 {
+            return Err("The printer didn't accept the document.".into());
+        }
+        let printed = job.pages.clone().try_for_each(|index| print_page(dc, index, &size, &mut band));
+        match printed {
+            Ok(()) if unsafe { EndDoc(dc) } > 0 => Ok(()),
+            Ok(()) => Err("The printer didn't finish the document.".into()),
+            Err(error) => {
+                unsafe { AbortDoc(dc) };
+                Err(error)
             }
         }
+    }
 
-        /// Prints one page centered on the paper, turned to match the paper's
-        /// orientation and shrunk if it doesn't fit, like macOS does.
-        unsafe fn print_page(&self, doc: Document, index: usize, dc: HDC) -> Result<(), String> {
-            const FPDF_ANNOT: c_int = 0x01;
-            const FPDF_PRINTING: c_int = 0x800;
-
-            let page = unsafe { (self.load_page)(doc, index as c_int) };
-            if page.is_null() {
-                return Err(format!("Couldn't read page {} for printing.", index + 1));
-            }
-            // The printable area, in printer pixels.
-            let caps = |index| unsafe { GetDeviceCaps(dc, index as i32) };
-            let (paper_width, paper_height) = (caps(HORZRES), caps(VERTRES));
-            let (mut width, mut height) = unsafe { ((self.page_width)(page), (self.page_height)(page)) };
-            let turn = (width > height) != (paper_width > paper_height);
-            if turn {
-                (width, height) = (height, width);
-            }
-            let (width, height) = (width / 72.0 * caps(LOGPIXELSX) as f32, height / 72.0 * caps(LOGPIXELSY) as f32);
-            let scale = (paper_width as f32 / width).min(paper_height as f32 / height).min(1.0);
-            let (width, height) = ((width * scale) as c_int, (height * scale) as c_int);
-
-            let started = unsafe { StartPage(dc) } > 0;
-            if started {
-                let (x, y) = ((paper_width - width) / 2, (paper_height - height) / 2);
-                unsafe { (self.render)(dc, page, x, y, width, height, c_int::from(turn), FPDF_ANNOT | FPDF_PRINTING) };
-            }
-            let ended = started && unsafe { EndPage(dc) } > 0;
-            unsafe { (self.close_page)(page) };
-            if ended { Ok(()) } else { Err("The printer stopped responding.".into()) }
+    /// Prints one page centered on the paper, turned to match the paper's
+    /// orientation and shrunk if it doesn't fit, like macOS does.
+    fn print_page(
+        dc: HDC,
+        index: usize,
+        size: impl Fn(usize) -> Option<(f32, f32)>,
+        mut band: impl FnMut(usize, (i32, i32), bool, Range<i32>) -> Option<Vec<u8>>,
+    ) -> Result<(), String> {
+        let unreadable = || format!("Couldn't read page {} for printing.", index + 1);
+        let (mut width, mut height) = size(index).ok_or_else(unreadable)?;
+        // The printable area, in printer pixels.
+        let caps = |index| unsafe { GetDeviceCaps(dc, index as i32) };
+        let (paper_width, paper_height) = (caps(HORZRES), caps(VERTRES));
+        let turn = (width > height) != (paper_width > paper_height);
+        if turn {
+            (width, height) = (height, width);
         }
+        let (width, height) = (width / 72.0 * caps(LOGPIXELSX) as f32, height / 72.0 * caps(LOGPIXELSY) as f32);
+        let scale = (paper_width as f32 / width).min(paper_height as f32 / height).min(1.0);
+        let (width, height) = (((width * scale) as i32).max(1), ((height * scale) as i32).max(1));
+        let (x, y) = ((paper_width - width) / 2, (paper_height - height) / 2);
+
+        if unsafe { StartPage(dc) } <= 0 {
+            return Err("The printer stopped responding.".into());
+        }
+        let mut rows = 0..BAND.min(height);
+        while !rows.is_empty() {
+            let pixels = band(index, (width, height), turn, rows.clone()).ok_or_else(unreadable)?;
+            let count = rows.len() as i32;
+            let header = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    // Negative: rows go top to bottom.
+                    biHeight: -count,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    ..BITMAPINFOHEADER::default()
+                },
+                ..BITMAPINFO::default()
+            };
+            let (top, bits) = (y + rows.start, pixels.as_ptr().cast());
+            let drawn = unsafe { StretchDIBits(dc, x, top, width, count, 0, 0, width, count, bits, &header, DIB_RGB_COLORS, SRCCOPY) };
+            if drawn <= 0 {
+                unsafe { EndPage(dc) };
+                return Err("The printer couldn't take the page.".into());
+            }
+            rows = rows.end..(rows.end + BAND).min(height);
+        }
+        if unsafe { EndPage(dc) } > 0 { Ok(()) } else { Err("The printer stopped responding.".into()) }
     }
 }

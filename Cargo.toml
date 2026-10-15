@@ -1,14 +1,16 @@
 [package]
 name = "rs-pdf-render"
-version = "0.1.0"
+version = "2.0.0"
 edition = "2024"
 description = "An ultralightweight PDF reader"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 # Defaults minus "thread-pool" (tokio runs tasks).
 iced = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "crisp", "web-colors", "linux-theme-detection", "x11", "wayland", "tokio", "image-without-codecs", "canvas", "svg"] }
-pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_latest"] }
+# MuPDF, built from source and linked in. Only its PDF support and the 14
+# standard fonts.
+mupdf = { version = "0.8", default-features = false, features = ["base14-fonts"] }
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 tokio = { version = "1", features = ["sync"] }
 
@@ -21,7 +23,7 @@ raw-window-handle = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_System_LibraryLoader", "Win32_UI_Controls_Dialogs", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_UI_Controls_Dialogs", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

@@ -1,5 +1,5 @@
-; The Windows installer. Build it with Inno Setup 6, after a release build and
-; with PDFium unpacked in pdfium-win-x64 (see the README):
+; The Windows installer. Build it with Inno Setup 6, after a release build
+; (see the README):
 ;
 ;   cargo build --release
 ;   ISCC installer\rs-pdf-render.iss
@@ -13,7 +13,6 @@
 #define AppExe "rs-pdf-render.exe"
 #define AppVersion GetStringFileInfo("..\target\release\" + AppExe, "ProductVersion")
 #define ProgId "rs-pdf-render.pdf"
-#define Pdfium "..\pdfium-win-x64"
 
 [Setup]
 AppId={{7430C6D2-0747-4E63-8BCF-4435748AE9BC}
@@ -41,11 +40,14 @@ Name: desktopicon; Description: "Create a desktop shortcut"; Flags: unchecked
 
 [Files]
 Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#Pdfium}\bin\pdfium.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"
-; PDFium's license and those of the libraries built into it.
-Source: "{#Pdfium}\LICENSE"; DestDir: "{app}\licenses"; DestName: "pdfium-binaries.txt"
-Source: "{#Pdfium}\licenses\*"; DestDir: "{app}\licenses"
+; MuPDF's license and those of the libraries built into it.
+Source: "..\licenses\*"; DestDir: "{app}\licenses"
+
+[InstallDelete]
+; Left by versions that used PDFium.
+Type: files; Name: "{app}\pdfium.dll"
+Type: filesandordirs; Name: "{app}\licenses"
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"

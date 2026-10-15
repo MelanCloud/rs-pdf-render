@@ -34,7 +34,7 @@ file or print it.
 - The installer isn't code-signed yet, so Windows may say "Windows protected
   your PC". Choose **More info**, then **Run anyway**.
 - Prefer no installer? The portable `.zip` on the same page runs from any
-  folder. Keep `pdfium.dll` next to the `.exe`.
+  folder.
 
 To uninstall, use Settings → Apps. Your settings stay in
 `%APPDATA%\rs-pdf-render` in case you come back.
@@ -62,7 +62,8 @@ there are no ready-made packages for them yet.
   and rotation.
 - **Pen:** a simple pen with four colors, undo and redo.
 - **Print:** the system print dialog, with your drawings included. On
-  Windows, text stays sharp because pages go to the printer as vectors.
+  Windows, pages go to the printer at its full resolution, so text stays
+  sharp.
 - **Password-protected PDFs:** it asks for the password, like Firefox.
 - **Light, dark or system theme.**
 - **Settings** (the gear button): smooth scrolling, sliding or instant
@@ -103,38 +104,29 @@ macOS, `~/.config/rs-pdf-render` on Linux).
 
 ## Building
 
-You need [Rust](https://rustup.rs) and the PDFium library, which the app
-loads when it starts.
+You need [Rust](https://rustup.rs), a C compiler and LLVM's libclang: the
+first build compiles [MuPDF](https://mupdf.com) into the app, which takes a
+few minutes.
 
-1. Download PDFium for your system from
-   [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries/releases/tag/chromium%2F8100),
-   release `chromium/8100`: `pdfium-win-x64.tgz`, `pdfium-mac-arm64.tgz` or
-   `pdfium-linux-x64.tgz`. With the GitHub CLI:
+- **Windows:** Visual Studio 2022 (or its Build Tools) with "Desktop
+  development with C++", and LLVM (`winget install LLVM.LLVM`).
+- **macOS:** the Xcode command line tools (`xcode-select --install`).
+- **Linux:** a C compiler, `make` and libclang (on Debian and Ubuntu:
+  `sudo apt install build-essential libclang-dev`).
 
-   ```sh
-   gh release download chromium/8100 -R bblanchon/pdfium-binaries -p pdfium-win-x64.tgz
-   ```
+Then:
 
-2. Unpack it into a folder named after the file (for example
-   `pdfium-win-x64/`) inside this repository, and copy the library into the
-   repository's top folder: `bin/pdfium.dll` on Windows,
-   `lib/libpdfium.dylib` on macOS, `lib/libpdfium.so` on Linux.
+```sh
+cargo run --release -- path/to/file.pdf
+```
 
-3. Run it:
-
-   ```sh
-   cargo run --release -- path/to/file.pdf
-   ```
-
-The app looks for PDFium next to itself first, then in the folder it was
-started from. To move a release build around, copy the library next to
-`target/release/rs-pdf-render` (`.exe` on Windows).
+The result is a single executable, `target/release/rs-pdf-render` (`.exe` on
+Windows), with nothing else to copy along.
 
 ### Windows installer
 
 With [Inno Setup 6](https://jrsoftware.org/isinfo.php) installed (for example
-`winget install JRSoftware.InnoSetup`) and PDFium unpacked in
-`pdfium-win-x64/`:
+`winget install JRSoftware.InnoSetup`):
 
 ```sh
 cargo build --release
@@ -145,21 +137,24 @@ The installer lands in `target/installer/`.
 
 ## Printing on each system
 
-- **Windows:** the system print dialog, then pages go straight to the
-  printer.
+- **Windows:** the system print dialog, then the app draws the pages for
+  the printer at its resolution.
 - **macOS:** the system print sheet, with a preview.
 - **Linux:** the document goes to the default printer with `lp`.
 
 ## Credits
 
-- [PDFium](https://pdfium.googlesource.com/pdfium/) (BSD-3-Clause) renders the
-  pages, through [pdfium-render](https://github.com/ajrcarey/pdfium-render) and
-  the builds from [pdfium-binaries](https://github.com/bblanchon/pdfium-binaries)
-  (MIT). The installer and the portable `.zip` include their licenses in a
-  `licenses` folder.
+- [MuPDF](https://mupdf.com) (AGPL-3.0, by Artifex) renders the pages,
+  through the [mupdf](https://github.com/messense/mupdf-rs) Rust crate. Its
+  license and those of the libraries built into it are in
+  [licenses](licenses), which the installer and the portable `.zip` include.
 - [iced](https://github.com/iced-rs/iced) (MIT) draws the interface.
 - The icons, including the paperclip in the app icon, are from
   [Lucide](https://lucide.dev) (ISC).
 - Behavior and colors follow Mozilla's [pdf.js](https://github.com/mozilla/pdf.js).
 
-rs-pdf-render itself is MIT licensed; see [LICENSE](LICENSE).
+## License
+
+Copyright © 2026 MelanCloud. rs-pdf-render is free software under the GNU
+Affero General Public License, version 3 or later, as MuPDF requires; see
+[LICENSE](LICENSE). The source code is this repository.

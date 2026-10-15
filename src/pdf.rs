@@ -1,8 +1,10 @@
-//! PDFium lives on its own thread. The UI talks to it through tokio channels.
+//! MuPDF lives on its own thread. The UI talks to it through tokio channels.
 
 use crate::ink::Stroke;
 use iced::widget::image;
-use pdfium_render::prelude::*;
+use mupdf::link::LinkDestination;
+use mupdf::text_page::TextPageFlags;
+use mupdf::{ColorParams, Colorspace, DestinationKind, Device, Document, IRect, Matrix, Page, Pixmap, Rect, StrokeState};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -35,10 +37,6 @@ pub enum Target {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bitmap {
     pub width: u32,
-    /// Subpixel (ClearType-style) text, like Acrobat's default on Windows.
-    /// Only for unrotated pages: the subpixel colors are laid out for
-    /// upright text, and the app turns rotated pages after rendering.
-    pub subpixel: bool,
 }
 
 /// A part of a page rendered at full sharpness, for zooms where the whole
@@ -47,7 +45,6 @@ pub struct Bitmap {
 pub struct Detail {
     /// The full page's width at this zoom, which the rest is measured in.
     pub page_width: u32,
-    pub subpixel: bool,
     pub x: u32,
     pub y: u32,
     pub width: u32,
@@ -58,7 +55,6 @@ impl Detail {
     /// Whether this already shows all of `other`.
     pub fn covers(&self, other: &Detail) -> bool {
         self.page_width == other.page_width
-            && self.subpixel == other.subpixel
             && self.x <= other.x
             && self.y <= other.y
             && self.x + self.width >= other.x + other.width
@@ -109,31 +105,30 @@ enum Request {
     Print(Vec<(usize, Stroke)>, crate::print::Job, oneshot::Sender<Result<(), String>>),
 }
 
-/// Handle to the PDFium thread. Cheap to clone.
+/// Handle to the MuPDF thread. Cheap to clone.
 #[derive(Clone)]
 pub struct Worker {
     tx: mpsc::UnboundedSender<Request>,
     /// Page index -> bitmap the UI still wants. Renders for anything else
-    /// (scrolled away, zoom or rotation changed since) are skipped.
+    /// (scrolled away, zoom changed since) are skipped.
     wanted: Wanted<Bitmap>,
     /// The same for sharp details.
     wanted_details: Wanted<Detail>,
 }
 
 /// Page index -> what the UI still wants rendered for it, shared with the
-/// PDFium thread.
+/// MuPDF thread.
 type Wanted<T> = Arc<Mutex<HashMap<usize, T>>>;
 
 impl Worker {
     pub fn spawn() -> Result<Self, String> {
-        let bindings = bind()?;
         let (tx, rx) = mpsc::unbounded_channel();
         let wanted = Arc::new(Mutex::new(HashMap::new()));
         let wanted_details = Arc::new(Mutex::new(HashMap::new()));
         let shared = (wanted.clone(), wanted_details.clone());
         std::thread::Builder::new()
-            .name("pdfium".into())
-            .spawn(move || run(Pdfium::new(bindings), rx, shared))
+            .name("mupdf".into())
+            .spawn(move || run(rx, shared))
             .map_err(|e| e.to_string())?;
         Ok(Self { tx, wanted, wanted_details })
     }
@@ -185,38 +180,12 @@ impl Worker {
     }
 }
 
-/// Looks for the PDFium library next to the executable, then in the working
-/// directory, then wherever the system keeps libraries.
-fn bind() -> Result<Box<dyn PdfiumLibraryBindings>, String> {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf));
-    exe_dir
-        .into_iter()
-        .chain([PathBuf::from(".")])
-        .find_map(|dir| {
-            Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&dir)).ok()
-        })
-        .map_or_else(Pdfium::bind_to_system_library, Ok)
-        .map_err(|_| {
-            format!(
-                "Couldn't find {}. Put it next to the app.",
-                Pdfium::pdfium_platform_library_name().to_string_lossy()
-            )
-        })
-}
-
-fn run(
-    pdfium: Pdfium,
-    mut rx: mpsc::UnboundedReceiver<Request>,
-    (wanted, wanted_details): (Wanted<Bitmap>, Wanted<Detail>),
-) {
+fn run(mut rx: mpsc::UnboundedReceiver<Request>, (wanted, wanted_details): (Wanted<Bitmap>, Wanted<Detail>)) {
     // The document on screen, with the password that unlocked it.
-    let mut open: Option<(PathBuf, Option<String>, PdfDocument)> = None;
-    // Scans read their own copy of the document, closed when the scan ends,
-    // because PDFium keeps everything it parses until its document closes
-    // (about 40 MB for a 1000-page book).
-    let mut scanning: Option<PdfDocument> = None;
+    let mut open: Option<(PathBuf, Option<String>, Document)> = None;
+    // Scans read their own copy of the document, dropped when the scan ends,
+    // so what they parse doesn't stay in memory with the open document.
+    let mut scanning: Option<Document> = None;
 
     while let Some(request) = rx.blocking_recv() {
         match request {
@@ -224,20 +193,12 @@ fn run(
                 // The current document stays open until the new one has
                 // opened, so a failed open (or a password prompt) leaves it
                 // on screen and working.
-                let result = pdfium
-                    .load_pdf_from_file(&path, password.as_deref())
-                    .map_err(|e| match e {
-                        PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError) => {
-                            OpenError::Password
-                        }
-                        _ => OpenError::Failed(format!("Couldn't open this file ({e}).")),
-                    })
-                    .map(|doc| {
-                        let info = describe(&doc);
-                        scanning = None;
-                        open = Some((path, password, doc));
-                        info
-                    });
+                let result = load(&path, password.as_deref()).map(|doc| {
+                    let info = describe(&doc);
+                    scanning = None;
+                    open = Some((path, password, doc));
+                    info
+                });
                 let _ = reply.send(result);
             }
             Request::Render(index, bitmap, reply) => {
@@ -258,17 +219,15 @@ fn run(
             }
             Request::Scan(pages, reply) => {
                 if pages.start == 0 {
-                    scanning = open
-                        .as_ref()
-                        .and_then(|(path, password, _)| pdfium.load_pdf_from_file(path, password.as_deref()).ok());
+                    scanning = open.as_ref().and_then(|(path, password, _)| load(path, password.as_deref()).ok());
                 }
                 let Some(doc) = &scanning else {
                     let _ = reply.send(Vec::new());
                     continue;
                 };
-                let last = pages.end >= doc.pages().len() as usize;
+                let last = pages.end >= doc.page_count().unwrap_or(0).max(0) as usize;
                 let found = pages
-                    .filter_map(|index| Some(headings(index, &doc.pages().get(index as PdfPageIndex).ok()?)))
+                    .filter_map(|index| Some(headings(index, &doc.load_page(index as i32).ok()?)))
                     .flatten()
                     .collect();
                 if last {
@@ -279,7 +238,7 @@ fn run(
             #[cfg(not(windows))]
             Request::Export(strokes, reply) => {
                 let result = match &open {
-                    Some((path, password, _)) => export(&pdfium, path, password.as_deref(), &strokes),
+                    Some((path, password, doc)) => export(path, password.is_some(), doc, &strokes),
                     None => Err("No document is open.".into()),
                 };
                 let _ = reply.send(result);
@@ -287,10 +246,10 @@ fn run(
             #[cfg(windows)]
             Request::Print(strokes, job, reply) => {
                 let result = match &open {
-                    Some((path, password, _)) => export(&pdfium, path, password.as_deref(), &strokes).and_then(|pdf| {
+                    Some((path, _, doc)) => {
                         let title = path.file_name().unwrap_or_default().to_string_lossy();
-                        crate::print::print(&job, &pdf, &title)
-                    }),
+                        print(doc, &strokes, &job, &title)
+                    }
                     None => Err("No document is open.".into()),
                 };
                 let _ = reply.send(result);
@@ -299,78 +258,99 @@ fn run(
     }
 }
 
-fn describe(doc: &PdfDocument) -> DocInfo {
-    let pages = doc
-        .pages()
-        .page_sizes()
-        .unwrap_or_default()
-        .iter()
-        .map(|rect| (rect.width().value, rect.height().value))
+/// Opens a file, unlocking it with `password` if it needs one. Files with
+/// only a permissions password open without one, as in pdf.js.
+fn load(path: &Path, password: Option<&str>) -> Result<Document, OpenError> {
+    // MuPDF takes paths as text on Windows.
+    #[cfg(windows)]
+    let path = path.to_str().ok_or_else(|| OpenError::Failed("Couldn't read this file's name.".into()))?;
+    let mut doc = Document::open(path).map_err(|e| OpenError::Failed(format!("Couldn't open this file ({e}).")))?;
+    if doc.needs_password().unwrap_or(false) {
+        let unlocked = password.is_some_and(|password| doc.authenticate(password).unwrap_or(false));
+        if !unlocked {
+            return Err(OpenError::Password);
+        }
+    }
+    Ok(doc)
+}
+
+fn describe(doc: &Document) -> DocInfo {
+    let count = doc.page_count().unwrap_or(0).max(0);
+    let pages = (0..count)
+        .map(|index| {
+            let bounds = doc.load_page(index).and_then(|page| page.bounds());
+            bounds.map_or((612.0, 792.0), |b| (b.x1 - b.x0, b.y1 - b.y0))
+        })
         .collect();
 
     let mut outline = Vec::new();
-    if let Some(root) = doc.bookmarks().root() {
-        collect_outline(root, 0, &mut outline);
-    }
+    collect_outline(&doc.outlines().unwrap_or_default(), 0, &mut outline);
 
     DocInfo { pages, outline }
 }
 
-fn collect_outline(first: PdfBookmark, depth: usize, out: &mut Vec<OutlineEntry>) {
-    // Broken files can contain cyclic outlines.
+fn collect_outline(items: &[mupdf::Outline], depth: usize, out: &mut Vec<OutlineEntry>) {
+    // Broken files can contain huge or deep outlines.
     const LIMIT: usize = 10_000;
 
-    let mut next = Some(first);
-    while let Some(bookmark) = next {
+    for item in items {
         if out.len() >= LIMIT || depth > 32 {
             return;
         }
-        let page = bookmark
-            .destination()
-            .and_then(|dest| dest.page_index().ok())
-            .or_else(|| {
-                let action = bookmark.action()?;
-                action.as_local_destination_action()?.destination().ok()?.page_index().ok()
-            })
-            .map(|index| index as usize);
         out.push(OutlineEntry {
-            title: bookmark.title().unwrap_or_default().trim().to_string(),
-            page,
+            title: item.title.trim().to_string(),
+            page: item.dest.map(|dest| dest.loc.page_number as usize),
             top: None,
             depth,
             scanned: false,
         });
-        if let Some(child) = bookmark.first_child() {
-            collect_outline(child, depth + 1, out);
-        }
-        next = bookmark.next_sibling();
+        collect_outline(&item.down, depth + 1, out);
     }
 }
+
+/// A character of a line, for finding headings.
+struct Char {
+    c: char,
+    bold: bool,
+    size: f32,
+    /// Its top edge, in page units.
+    top: f32,
+}
+
+/// A piece of a line of text: its baseline, left and right edges, and
+/// characters.
+type Piece = (f32, f32, f32, Vec<Char>);
 
 /// Finds numbered headings in a page's text: lines that start with a number
 /// of two or more parts and a title, set bolder or larger than the page's body
 /// text (which leaves out running headers and plain mentions).
-fn headings(index: usize, page: &PdfPage) -> Vec<Heading> {
-    let Ok(text) = page.text() else { return Vec::new() };
-    let chars = text.chars();
-    // Each line's characters (with their index on the page) and largest size.
-    let mut lines: Vec<(Vec<(char, usize)>, f32)> = vec![(Vec::new(), 0.0)];
+fn headings(index: usize, page: &Page) -> Vec<Heading> {
+    let (Ok(bounds), Ok(text)) = (page.bounds(), page.to_text_page(TextPageFlags::empty())) else {
+        return Vec::new();
+    };
+    let mut pieces: Vec<Piece> = Vec::new();
     let mut sizes = Vec::new();
-    for (at, char) in chars.iter().enumerate() {
-        let Some(c) = char.unicode_char() else { continue };
-        let Some(line) = lines.last_mut() else { continue };
-        if c == '\n' || c == '\r' {
-            if !line.0.is_empty() {
-                lines.push((Vec::new(), 0.0));
+    for block in text.blocks() {
+        for line in block.lines() {
+            let mut chars = Vec::new();
+            let mut baseline = None;
+            for ch in line.chars() {
+                let Some(c) = ch.char() else { continue };
+                let bold = ch.font().is_some_and(|font| {
+                    let name = font.name().to_lowercase();
+                    font.is_bold() || ["bold", "black", "heavy", "semibold", "demi"].iter().any(|weight| name.contains(weight))
+                });
+                if !c.is_whitespace() {
+                    sizes.push(ch.size());
+                }
+                baseline.get_or_insert(ch.origin().y);
+                chars.push(Char { c, bold, size: ch.size(), top: ch.quad().ul.y });
             }
-            continue;
+            if let Some(baseline) = baseline {
+                let edges = line.bounds();
+                pieces.push((baseline, edges.x0, edges.x1, chars));
+            }
         }
-        if !c.is_whitespace() {
-            let size = char.scaled_font_size().value;
-            sizes.push(size);
-            line.1 = line.1.max(size);
-        }
-        line.0.push((c, at));
     }
     if sizes.is_empty() {
         return Vec::new();
@@ -378,24 +358,47 @@ fn headings(index: usize, page: &PdfPage) -> Vec<Heading> {
     sizes.sort_by(f32::total_cmp);
     let body = sizes[sizes.len() / 2];
 
+    // MuPDF splits a line where there's a wide gap ("1.1.1   Introduction"),
+    // so pieces on the same baseline are joined again, unless they're so far
+    // apart that they're in different columns.
+    pieces.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut rows: Vec<Vec<Piece>> = Vec::new();
+    for piece in pieces {
+        match rows.last_mut() {
+            Some(row) if (piece.0 - row[0].0).abs() < body * 0.3 => row.push(piece),
+            _ => rows.push(vec![piece]),
+        }
+    }
+    let mut lines: Vec<Vec<Char>> = Vec::new();
+    for mut row in rows {
+        row.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let mut right: Option<f32> = None;
+        for (_, left, end, chars) in row {
+            match lines.last_mut() {
+                Some(line) if right.is_some_and(|right| left - right < body * 4.0) => {
+                    let last = &line[line.len() - 1];
+                    let space = Char { c: ' ', bold: last.bold, size: last.size, top: last.top };
+                    line.push(space);
+                    line.extend(chars);
+                }
+                _ => lines.push(chars),
+            }
+            right = Some(end);
+        }
+    }
+
     lines
         .iter()
-        .filter_map(|(line, size)| {
-            let text: String = line.iter().map(|(c, _)| c).collect();
+        .filter_map(|chars| {
+            let text: String = chars.iter().map(|ch| ch.c).collect();
             let (number, title) = numbered(&text)?;
-            let first = chars.get(line[title].1 as PdfPageTextCharIndex).ok()?;
-            let name = first.font_name().to_lowercase();
-            let bold = matches!(
-                first.font_weight(),
-                Some(PdfFontWeight::Weight600 | PdfFontWeight::Weight700Bold | PdfFontWeight::Weight800 | PdfFontWeight::Weight900)
-            ) || ["bold", "black", "heavy", "semibold", "demi"].iter().any(|weight| name.contains(weight));
-            if !bold && *size < body * 1.1 {
+            let first = chars.get(title)?;
+            let size = chars.iter().filter(|ch| !ch.c.is_whitespace()).map(|ch| ch.size).fold(0.0, f32::max);
+            if !first.bold && size < body * 1.1 {
                 return None;
             }
-            let bounds = first.loose_bounds().ok()?;
-            let (_, top) = fraction(page, bounds.left(), bounds.top())?;
             // A little room above, so the heading isn't flush with the edge.
-            let top = (top - 0.015).clamp(0.0, 1.0);
+            let top = ((first.top - bounds.y0) / (bounds.y1 - bounds.y0) - 0.015).clamp(0.0, 1.0);
             let title = text.split_whitespace().collect::<Vec<_>>().join(" ");
             Some(Heading { number, title, page: index, top })
         })
@@ -475,133 +478,175 @@ pub fn merge(outline: &[OutlineEntry], headings: Vec<Heading>) -> Vec<OutlineEnt
     merged
 }
 
-fn render(doc: &PdfDocument, index: usize, bitmap: Bitmap) -> Option<Rendered> {
-    let page = doc.pages().get(index as PdfPageIndex).ok()?;
-    let config = PdfRenderConfig::new()
-        .set_target_width(bitmap.width as Pixels)
-        .use_lcd_text_rendering(bitmap.subpixel)
-        // PDFium only draws subpixel text on opaque bitmaps.
-        .set_format(PdfBitmapFormat::BGRx)
-        .render_form_data(true);
-    let bitmap = page.render_with_config(&config).ok()?;
-    let image = image::Handle::from_rgba(bitmap.width() as u32, bitmap.height() as u32, bitmap.as_rgba_bytes());
-    Some((image, links(doc, &page)))
+fn render(doc: &Document, index: usize, bitmap: Bitmap) -> Option<Rendered> {
+    let page = doc.load_page(index as i32).ok()?;
+    let bounds = page.bounds().ok()?;
+    let width = bitmap.width as f32;
+    let height = (width * (bounds.y1 - bounds.y0) / (bounds.x1 - bounds.x0)).round().max(1.0);
+    let area = IRect::new(0, 0, width as i32, height as i32);
+    let content = |device: &Device, ctm: &Matrix| page.run(device, ctm);
+    let pixmap = draw(bounds, content, &[], &Colorspace::device_rgb(), (width, height), false, area).ok()?;
+    let image = image::Handle::from_rgba(pixmap.width(), pixmap.height(), pixmap.samples().to_vec());
+    Some((image, links(doc, &page, bounds)))
 }
 
-/// Renders part of a page into a bitmap of just that size, by putting the
-/// page's top-left corner off the bitmap's edge.
-fn render_detail(doc: &PdfDocument, index: usize, detail: Detail) -> Option<image::Handle> {
-    let page = doc.pages().get(index as PdfPageIndex).ok()?;
-    let config = PdfRenderConfig::new()
-        .set_target_width(detail.page_width as Pixels)
-        .use_lcd_text_rendering(detail.subpixel)
-        .set_format(PdfBitmapFormat::BGRx)
-        .set_origin(-(detail.x as Pixels), -(detail.y as Pixels))
-        .render_form_data(true);
-    let mut bitmap = PdfBitmap::empty(detail.width as Pixels, detail.height as Pixels, PdfBitmapFormat::BGRx).ok()?;
-    page.render_into_bitmap_with_config(&mut bitmap, &config).ok()?;
-    Some(image::Handle::from_rgba(detail.width, detail.height, bitmap.as_rgba_bytes()))
+/// Renders part of a page into a bitmap of just that size.
+fn render_detail(doc: &Document, index: usize, detail: Detail) -> Option<image::Handle> {
+    let page = doc.load_page(index as i32).ok()?;
+    let bounds = page.bounds().ok()?;
+    let width = detail.page_width as f32;
+    let height = width * (bounds.y1 - bounds.y0) / (bounds.x1 - bounds.x0);
+    let (x, y) = (detail.x as i32, detail.y as i32);
+    let area = IRect::new(x, y, x + detail.width as i32, y + detail.height as i32);
+    let content = |device: &Device, ctm: &Matrix| page.run(device, ctm);
+    let pixmap = draw(bounds, content, &[], &Colorspace::device_rgb(), (width, height), false, area).ok()?;
+    Some(image::Handle::from_rgba(detail.width, detail.height, pixmap.samples().to_vec()))
 }
 
-/// Size of the virtual bitmap used to turn PDF points into fractions of the
-/// page and back, so pages with their own rotation or odd origins line up.
-const VIRTUAL_WIDTH: f32 = 10_000.0;
-
-/// Where a point of `page` lands, as fractions of the page from the top left.
-fn fraction(page: &PdfPage, x: PdfPoints, y: PdfPoints) -> Option<(f32, f32)> {
-    let config = PdfRenderConfig::new().set_target_width(VIRTUAL_WIDTH as Pixels);
-    let height = VIRTUAL_WIDTH * page.height().value / page.width().value;
-    let (px, py) = page.points_to_pixels(x, y, &config).ok()?;
-    Some((px as f32 / VIRTUAL_WIDTH, py as f32 / height))
+/// Draws a page's `content` and drawings on it, scaled to `size` in pixels
+/// and turned a quarter clockwise if asked, into opaque pixels (four bytes
+/// each, in the order of `colors`) covering just `area` of it.
+fn draw(
+    bounds: Rect,
+    content: impl FnOnce(&Device, &Matrix) -> Result<(), mupdf::Error>,
+    strokes: &[&Stroke],
+    colors: &Colorspace,
+    (width, height): (f32, f32),
+    turn: bool,
+    area: IRect,
+) -> Result<Pixmap, mupdf::Error> {
+    let (page_width, page_height) = (bounds.x1 - bounds.x0, bounds.y1 - bounds.y0);
+    let (dx, dy) = (area.x0 as f32, area.y0 as f32);
+    // MuPDF maps x' = a·x + c·y + e and y' = b·x + d·y + f.
+    let ctm = if turn {
+        // The page's left edge goes to the top.
+        let (sx, sy) = (height / page_width, width / page_height);
+        Matrix::new(0.0, sx, -sy, 0.0, width + bounds.y0 * sy - dx, -bounds.x0 * sx - dy)
+    } else {
+        let (sx, sy) = (width / page_width, height / page_height);
+        Matrix::new(sx, 0.0, 0.0, sy, -bounds.x0 * sx - dx, -bounds.y0 * sy - dy)
+    };
+    let mut pixmap = Pixmap::new(colors, 0, 0, area.x1 - area.x0, area.y1 - area.y0, true)?;
+    pixmap.clear_with(255)?;
+    let device = Device::from_pixmap(&pixmap)?;
+    content(&device, &ctm)?;
+    ink(&device, bounds, strokes, &ctm)?;
+    drop(device);
+    Ok(pixmap)
 }
 
-fn links(doc: &PdfDocument, page: &PdfPage) -> Vec<Link> {
-    page.links()
-        .iter()
+/// Draws strokes onto a page being drawn with `ctm`.
+fn ink(device: &Device, bounds: Rect, strokes: &[&Stroke], ctm: &Matrix) -> Result<(), mupdf::Error> {
+    let (page_width, page_height) = (bounds.x1 - bounds.x0, bounds.y1 - bounds.y0);
+    let rgb = Colorspace::device_rgb();
+    for stroke in strokes {
+        let Some(&(u, v)) = stroke.points.first() else { continue };
+        // Strokes are stored as fractions of the page.
+        let at = |(u, v): (f32, f32)| (bounds.x0 + u * page_width, bounds.y0 + v * page_height);
+        let mut path = mupdf::Path::new()?;
+        let (x, y) = at((u, v));
+        path.move_to(x, y)?;
+        // A single point still shows, as a dot.
+        for &point in stroke.points.iter().skip(1).chain((stroke.points.len() == 1).then_some(&(u, v))) {
+            let (x, y) = at(point);
+            path.line_to(x, y)?;
+        }
+        use mupdf::stroke_state::{LineCap, LineJoin};
+        let style = StrokeState::new(LineCap::Round, LineCap::Round, LineCap::Round, LineJoin::Round, stroke.width, 10.0, 0.0, &[])?;
+        let color = stroke.color;
+        let rgb_color = [color.r, color.g, color.b];
+        device.stroke_path(&path, &style, ctm, &rgb, &rgb_color, color.a, ColorParams::default())?;
+    }
+    Ok(())
+}
+
+fn links(doc: &Document, page: &Page, bounds: Rect) -> Vec<Link> {
+    let (width, height) = (bounds.x1 - bounds.x0, bounds.y1 - bounds.y0);
+    let Ok(links) = page.links() else { return Vec::new() };
+    links
         .filter_map(|link| {
-            let rect = link.rect().ok()?;
-            let (left, top) = fraction(page, rect.left(), rect.top())?;
-            let (right, bottom) = fraction(page, rect.right(), rect.bottom())?;
-            let target = match link.destination() {
-                Some(destination) => target(doc, &destination),
-                None => {
-                    let action = link.action()?;
-                    match action.as_uri_action() {
-                        Some(uri) => uri.uri().ok().map(Target::Web),
-                        None => target(doc, &action.as_local_destination_action()?.destination().ok()?),
-                    }
-                }
-            }?;
-            // A page with its own rotation can swap the corners.
-            Some(Link { area: [left.min(right), top.min(bottom), left.max(right), top.max(bottom)], target })
+            let rect = link.bounds;
+            let area = [
+                (rect.x0 - bounds.x0) / width,
+                (rect.y0 - bounds.y0) / height,
+                (rect.x1 - bounds.x0) / width,
+                (rect.y1 - bounds.y0) / height,
+            ];
+            let target = match link.dest {
+                Some(dest) => target(doc, dest),
+                None if link.uri.contains("://") || link.uri.starts_with("mailto:") => Target::Web(link.uri),
+                None => return None,
+            };
+            Some(Link { area, target })
         })
         .collect()
 }
 
-fn target(doc: &PdfDocument, destination: &PdfDestination) -> Option<Target> {
-    let index = destination.page_index().ok()? as usize;
-    let top = match destination.view_settings().ok()? {
-        PdfDestinationViewSettings::SpecificCoordinatesAndZoom(_, Some(top), _)
-        | PdfDestinationViewSettings::FitPageHorizontallyToWindow(Some(top)) => {
-            let page = doc.pages().get(index as PdfPageIndex).ok()?;
-            fraction(&page, PdfPoints::new(0.0), top).map(|(_, y)| y.clamp(0.0, 1.0))
+fn target(doc: &Document, dest: LinkDestination) -> Target {
+    let index = dest.loc.page_number as usize;
+    let top = match dest.kind {
+        DestinationKind::XYZ { top: Some(top), .. }
+        | DestinationKind::FitH { top: Some(top) }
+        | DestinationKind::FitBH { top: Some(top) } => {
+            let bounds = doc.load_page(index as i32).and_then(|page| page.bounds()).ok();
+            bounds.map(|b| ((top - b.y0) / (b.y1 - b.y0)).clamp(0.0, 1.0))
         }
         _ => None,
     };
-    Some(Target::Page(index, top))
+    Target::Page(index, top)
 }
 
 /// The file as it should go to the printer: drawings burned in, and never
-/// locked, so the system's printing doesn't need the password.
-fn export(
-    pdfium: &Pdfium,
-    path: &Path,
-    password: Option<&str>,
-    strokes: &[(usize, Stroke)],
-) -> Result<Vec<u8>, String> {
-    if strokes.is_empty() && password.is_none() {
+/// locked, so the system's printing doesn't need the password. A copy is
+/// written page by page, which also drops the lock.
+#[cfg(not(windows))]
+fn export(path: &Path, locked: bool, doc: &Document, strokes: &[(usize, Stroke)]) -> Result<Vec<u8>, String> {
+    if strokes.is_empty() && !locked {
         return std::fs::read(path).map_err(|e| e.to_string());
     }
-
-    let source = pdfium
-        .load_pdf_from_file(path, password)
-        .map_err(|e| e.to_string())?;
-    // PDFium saves a locked file still locked, so a locked file's pages are
-    // copied into a new document instead.
-    let mut doc = if password.is_some() {
-        let mut copy = pdfium.create_new_pdf().map_err(|e| e.to_string())?;
-        copy.pages_mut().append(&source).map_err(|e| e.to_string())?;
-        copy
-    } else {
-        source
-    };
-    for (index, stroke) in strokes {
-        burn_in(&mut doc, *index, stroke).map_err(|e| e.to_string())?;
-    }
-    doc.save_to_bytes().map_err(|e| e.to_string())
+    let copy = std::env::temp_dir().join(format!("rs-pdf-render-print-{}.pdf", std::process::id()));
+    let written = (|| -> Result<(), mupdf::Error> {
+        let mut writer = mupdf::DocumentWriter::new(&*copy, "pdf", "")?;
+        for index in 0..doc.page_count()? {
+            let page = doc.load_page(index)?;
+            let bounds = page.bounds()?;
+            let device = writer.begin_page(Rect::new(0.0, 0.0, bounds.x1 - bounds.x0, bounds.y1 - bounds.y0))?;
+            let ctm = Matrix::new_translate(-bounds.x0, -bounds.y0);
+            page.run(&device, &ctm)?;
+            let on_page: Vec<&Stroke> = strokes.iter().filter(|(at, _)| *at == index as usize).map(|(_, s)| s).collect();
+            ink(&device, bounds, &on_page, &ctm)?;
+            writer.end_page(device)?;
+        }
+        Ok(())
+    })();
+    let result = written.map_err(|e| e.to_string()).and_then(|()| std::fs::read(&copy).map_err(|e| e.to_string()));
+    let _ = std::fs::remove_file(&copy);
+    result
 }
 
-fn burn_in(doc: &mut PdfDocument, index: usize, stroke: &Stroke) -> Result<(), PdfiumError> {
-    // Strokes are stored relative to the page, so map them through the
-    // virtual bitmap to get PDF coordinates.
-    let mut page = doc.pages().get(index as PdfPageIndex)?;
-    let config = PdfRenderConfig::new().set_target_width(VIRTUAL_WIDTH as Pixels);
-    let height = VIRTUAL_WIDTH * page.height().value / page.width().value;
-    let points = stroke
-        .points
-        .iter()
-        .map(|(u, v)| page.pixels_to_points((u * VIRTUAL_WIDTH) as Pixels, (v * height) as Pixels, &config))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let [r, g, b, a] = stroke.color.into_rgba8();
-    let color = PdfColor::new(r, g, b, a);
-    let (x, y) = points[0];
-    let mut path = PdfPagePathObject::new(doc, x, y, Some(color), Some(PdfPoints::new(stroke.width)), None)?;
-    for (x, y) in &points[1..] {
-        path.line_to(*x, *y)?;
-    }
-    path.set_line_cap(PdfPageObjectLineCap::Round)?;
-    path.set_line_join(PdfPageObjectLineJoin::Round)?;
-    page.objects_mut().add_path_object(path)?;
-    Ok(())
+/// Prints the pages the job asks for, drawings included, as pictures at the
+/// printer's resolution.
+#[cfg(windows)]
+fn print(doc: &Document, strokes: &[(usize, Stroke)], job: &crate::print::Job, title: &str) -> Result<(), String> {
+    // The page being printed, drawn in bands from a recording of it so
+    // it's only read once.
+    let mut current: Option<(usize, mupdf::DisplayList, Rect)> = None;
+    let size = |index: usize| {
+        let bounds = doc.load_page(index as i32).and_then(|page| page.bounds()).ok()?;
+        Some((bounds.x1 - bounds.x0, bounds.y1 - bounds.y0))
+    };
+    let band = |index: usize, (width, height): (i32, i32), turn: bool, rows: std::ops::Range<i32>| {
+        if current.as_ref().is_none_or(|(at, ..)| *at != index) {
+            let page = doc.load_page(index as i32).ok()?;
+            current = Some((index, page.to_display_list(true).ok()?, page.bounds().ok()?));
+        }
+        let (_, list, bounds) = current.as_ref()?;
+        let on_page: Vec<&Stroke> = strokes.iter().filter(|(at, _)| *at == index).map(|(_, s)| s).collect();
+        let area = IRect::new(0, rows.start, width, rows.end);
+        let clip = Rect::new(0.0, 0.0, width as f32, rows.len() as f32);
+        let content = |device: &Device, ctm: &Matrix| list.run(device, ctm, clip);
+        let pixmap = draw(*bounds, content, &on_page, &Colorspace::device_bgr(), (width as f32, height as f32), turn, area);
+        pixmap.ok().map(|pixmap| pixmap.samples().to_vec())
+    };
+    crate::print::print(job, title, size, band)
 }
