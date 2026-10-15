@@ -1,0 +1,24 @@
+[package]
+name = "rs-pdf-render"
+version = "0.1.0"
+edition = "2024"
+description = "An ultralightweight PDF reader"
+license = "MIT"
+
+[dependencies]
+iced = { version = "0.14", features = ["tokio", "image-without-codecs", "canvas", "svg"] }
+pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_latest"] }
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+tokio = { version = "1", features = ["sync"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPrintOperation", "NSPrintInfo", "NSResponder", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
+objc2-pdf-kit = { version = "0.3", default-features = false, features = ["std", "PDFDocument", "objc2-app-kit"] }
+raw-window-handle = "0.6"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

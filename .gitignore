@@ -1,0 +1,4 @@
+/target
+/libpdfium.*
+/pdfium.dll
+/CLAUDE.md
