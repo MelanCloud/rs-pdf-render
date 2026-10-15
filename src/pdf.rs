@@ -15,6 +15,25 @@ pub struct DocInfo {
     pub outline: Vec<OutlineEntry>,
 }
 
+/// A clickable area on a page.
+#[derive(Debug, Clone)]
+pub struct Link {
+    /// Left, top, right, bottom as fractions of the page, (0, 0) at top left.
+    pub area: [f32; 4],
+    pub target: Target,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Target {
+    /// A page, and how far down it to show, from 0 to 1, if the link says.
+    Page(usize, Option<f32>),
+    /// A web or email address.
+    Web(String),
+}
+
+/// A rendered page and its links.
+pub type Rendered = (image::Handle, Vec<Link>);
+
 /// Why a file didn't open.
 #[derive(Debug, Clone)]
 pub enum OpenError {
@@ -32,7 +51,7 @@ pub struct OutlineEntry {
 
 enum Request {
     Open(PathBuf, Option<String>, oneshot::Sender<Result<DocInfo, OpenError>>),
-    Render(usize, u32, oneshot::Sender<Option<image::Handle>>),
+    Render(usize, u32, oneshot::Sender<Option<Rendered>>),
     #[cfg(not(windows))]
     Export(Vec<(usize, Stroke)>, oneshot::Sender<Result<Vec<u8>, String>>),
     #[cfg(windows)]
@@ -71,7 +90,7 @@ impl Worker {
         rx.await.unwrap_or_else(|_| Err(OpenError::Failed("PDF engine stopped".into())))
     }
 
-    pub async fn render(self, page: usize, width: u32) -> Option<image::Handle> {
+    pub async fn render(self, page: usize, width: u32) -> Option<Rendered> {
         let (reply, rx) = oneshot::channel();
         let _ = self.tx.send(Request::Render(page, width, reply));
         rx.await.ok().flatten()
@@ -221,17 +240,62 @@ fn collect_outline(first: PdfBookmark, depth: usize, out: &mut Vec<OutlineEntry>
     }
 }
 
-fn render(doc: &PdfDocument, index: usize, width: u32) -> Option<image::Handle> {
+fn render(doc: &PdfDocument, index: usize, width: u32) -> Option<Rendered> {
     let page = doc.pages().get(index as PdfPageIndex).ok()?;
     let config = PdfRenderConfig::new()
         .set_target_width(width as Pixels)
         .render_form_data(true);
     let bitmap = page.render_with_config(&config).ok()?;
-    Some(image::Handle::from_rgba(
-        bitmap.width() as u32,
-        bitmap.height() as u32,
-        bitmap.as_rgba_bytes(),
-    ))
+    let image = image::Handle::from_rgba(bitmap.width() as u32, bitmap.height() as u32, bitmap.as_rgba_bytes());
+    Some((image, links(doc, &page)))
+}
+
+/// Size of the virtual bitmap used to turn PDF points into fractions of the
+/// page and back, so pages with their own rotation or odd origins line up.
+const VIRTUAL_WIDTH: f32 = 10_000.0;
+
+/// Where a point of `page` lands, as fractions of the page from the top left.
+fn fraction(page: &PdfPage, x: PdfPoints, y: PdfPoints) -> Option<(f32, f32)> {
+    let config = PdfRenderConfig::new().set_target_width(VIRTUAL_WIDTH as Pixels);
+    let height = VIRTUAL_WIDTH * page.height().value / page.width().value;
+    let (px, py) = page.points_to_pixels(x, y, &config).ok()?;
+    Some((px as f32 / VIRTUAL_WIDTH, py as f32 / height))
+}
+
+fn links(doc: &PdfDocument, page: &PdfPage) -> Vec<Link> {
+    page.links()
+        .iter()
+        .filter_map(|link| {
+            let rect = link.rect().ok()?;
+            let (left, top) = fraction(page, rect.left(), rect.top())?;
+            let (right, bottom) = fraction(page, rect.right(), rect.bottom())?;
+            let target = match link.destination() {
+                Some(destination) => target(doc, &destination),
+                None => {
+                    let action = link.action()?;
+                    match action.as_uri_action() {
+                        Some(uri) => uri.uri().ok().map(Target::Web),
+                        None => target(doc, &action.as_local_destination_action()?.destination().ok()?),
+                    }
+                }
+            }?;
+            // A page with its own rotation can swap the corners.
+            Some(Link { area: [left.min(right), top.min(bottom), left.max(right), top.max(bottom)], target })
+        })
+        .collect()
+}
+
+fn target(doc: &PdfDocument, destination: &PdfDestination) -> Option<Target> {
+    let index = destination.page_index().ok()? as usize;
+    let top = match destination.view_settings().ok()? {
+        PdfDestinationViewSettings::SpecificCoordinatesAndZoom(_, Some(top), _)
+        | PdfDestinationViewSettings::FitPageHorizontallyToWindow(Some(top)) => {
+            let page = doc.pages().get(index as PdfPageIndex).ok()?;
+            fraction(&page, PdfPoints::new(0.0), top).map(|(_, y)| y.clamp(0.0, 1.0))
+        }
+        _ => None,
+    };
+    Some(Target::Page(index, top))
 }
 
 /// The file as it should go to the printer: drawings burned in, and never
@@ -265,18 +329,15 @@ fn export(
 }
 
 fn burn_in(doc: &mut PdfDocument, index: usize, stroke: &Stroke) -> Result<(), PdfiumError> {
-    // Strokes are stored relative to the page, so map them through a large
-    // virtual bitmap to get PDF coordinates that respect the page's own
-    // rotation and origin.
-    const SIZE: f32 = 10_000.0;
-
+    // Strokes are stored relative to the page, so map them through the
+    // virtual bitmap to get PDF coordinates.
     let mut page = doc.pages().get(index as PdfPageIndex)?;
-    let config = PdfRenderConfig::new().set_target_width(SIZE as Pixels);
-    let height = SIZE * page.height().value / page.width().value;
+    let config = PdfRenderConfig::new().set_target_width(VIRTUAL_WIDTH as Pixels);
+    let height = VIRTUAL_WIDTH * page.height().value / page.width().value;
     let points = stroke
         .points
         .iter()
-        .map(|(u, v)| page.pixels_to_points((u * SIZE) as Pixels, (v * height) as Pixels, &config))
+        .map(|(u, v)| page.pixels_to_points((u * VIRTUAL_WIDTH) as Pixels, (v * height) as Pixels, &config))
         .collect::<Result<Vec<_>, _>>()?;
 
     let [r, g, b, a] = stroke.color.into_rgba8();

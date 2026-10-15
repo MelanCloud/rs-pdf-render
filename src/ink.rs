@@ -1,9 +1,10 @@
 //! Freehand drawing on top of a page.
 
 use crate::Message;
+use crate::pdf::Link;
 use iced::mouse::{self, Cursor};
 use iced::widget::canvas::{self, Action, Event, Frame, Geometry, Path, Program};
-use iced::{Color, Point, Rectangle, Renderer, Size, Theme};
+use iced::{Color, Point, Rectangle, Renderer, Size, Theme, Vector};
 
 #[derive(Debug, Clone)]
 pub struct Stroke {
@@ -28,16 +29,19 @@ pub struct Ink<'a> {
     pub pen: Option<Color>,
 }
 
-impl Ink<'_> {
-    fn to_page(&self, p: Point, size: Size) -> (f32, f32) {
-        let (x, y) = ((p.x / size.width).clamp(0.0, 1.0), (p.y / size.height).clamp(0.0, 1.0));
-        match self.rotation {
-            90 => (y, 1.0 - x),
-            180 => (1.0 - x, 1.0 - y),
-            270 => (1.0 - y, x),
-            _ => (x, y),
-        }
+/// Turns a point on the turned page on screen into fractions of the unrotated
+/// page, (0, 0) at its top left.
+fn to_page(rotation: u16, p: Point, size: Size) -> (f32, f32) {
+    let (x, y) = ((p.x / size.width).clamp(0.0, 1.0), (p.y / size.height).clamp(0.0, 1.0));
+    match rotation {
+        90 => (y, 1.0 - x),
+        180 => (1.0 - x, 1.0 - y),
+        270 => (1.0 - y, x),
+        _ => (x, y),
     }
+}
+
+impl Ink<'_> {
 
     fn to_screen(&self, (u, v): (f32, f32), size: Size) -> Point {
         let (x, y) = match self.rotation {
@@ -85,7 +89,7 @@ impl Program<Message> for Ink<'_> {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let p = cursor.position_in(bounds)?;
                 *current = Some(Stroke {
-                    points: vec![self.to_page(p, bounds.size())],
+                    points: vec![to_page(self.rotation, p, bounds.size())],
                     color,
                     width: PEN_WIDTH,
                 });
@@ -94,7 +98,7 @@ impl Program<Message> for Ink<'_> {
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
                 let stroke = current.as_mut()?;
                 let p = *position - bounds.position();
-                stroke.points.push(self.to_page(Point::new(p.x, p.y), bounds.size()));
+                stroke.points.push(to_page(self.rotation, Point::new(p.x, p.y), bounds.size()));
                 Some(Action::request_redraw().and_capture())
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
@@ -136,28 +140,72 @@ impl Program<Message> for Ink<'_> {
     }
 }
 
-/// Invisible layer over the document that turns Ctrl/Cmd + wheel into zoom
-/// before the scrollable can use it to scroll.
-pub struct WheelZoom {
-    pub active: bool,
+/// The clickable links of one page. Left out while drawing, so the pen can
+/// draw over links.
+pub struct Links<'a> {
+    pub links: &'a [Link],
+    pub rotation: u16,
 }
 
-impl Program<Message> for WheelZoom {
+impl Links<'_> {
+    fn under(&self, bounds: Rectangle, cursor: Cursor) -> Option<&Link> {
+        let (x, y) = to_page(self.rotation, cursor.position_in(bounds)?, bounds.size());
+        let inside = |link: &&Link| {
+            let [left, top, right, bottom] = link.area;
+            (left..=right).contains(&x) && (top..=bottom).contains(&y)
+        };
+        self.links.iter().find(inside)
+    }
+}
+
+impl Program<Message> for Links<'_> {
+    type State = ();
+
+    fn update(&self, _: &mut (), event: &Event, bounds: Rectangle, cursor: Cursor) -> Option<Action<Message>> {
+        let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event else { return None };
+        let link = self.under(bounds, cursor)?;
+        Some(Action::publish(Message::FollowLink(link.target.clone())).and_capture())
+    }
+
+    fn draw(&self, _: &(), _: &Renderer, _: &Theme, _: Rectangle, _: Cursor) -> Vec<Geometry> {
+        Vec::new()
+    }
+
+    fn mouse_interaction(&self, _: &(), bounds: Rectangle, cursor: Cursor) -> mouse::Interaction {
+        if self.under(bounds, cursor).is_some() { mouse::Interaction::Pointer } else { mouse::Interaction::default() }
+    }
+}
+
+/// Invisible layer over the document that turns Ctrl/Cmd + wheel into zoom,
+/// and mouse wheel notches into scrolling at the chosen speed (gliding when
+/// smooth scrolling is on), before the scroll area sees them. Trackpads (pixel
+/// deltas) keep scrolling natively, as in Chromium.
+pub struct Wheel {
+    pub zoom: bool,
+    pub shift: bool,
+    /// Pixels per notch.
+    pub notch: f32,
+}
+
+impl Program<Message> for Wheel {
     type State = ();
 
     fn update(&self, _: &mut (), event: &Event, bounds: Rectangle, cursor: Cursor) -> Option<Action<Message>> {
         let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event else {
             return None;
         };
-        if !self.active {
-            return None;
-        }
         let at = cursor.position_in(bounds)?;
-        let y = match delta {
-            mouse::ScrollDelta::Lines { y, .. } => *y,
-            mouse::ScrollDelta::Pixels { y, .. } => *y / 40.0,
-        };
-        Some(Action::publish(Message::WheelZoom(y, at)).and_capture())
+        if self.zoom {
+            let y = match delta {
+                mouse::ScrollDelta::Lines { y, .. } => *y,
+                mouse::ScrollDelta::Pixels { y, .. } => *y / 40.0,
+            };
+            return Some(Action::publish(Message::WheelZoom(y, at)).and_capture());
+        }
+        let mouse::ScrollDelta::Lines { x, y } = *delta else { return None };
+        // Shift scrolls sideways, as in the scroll area (macOS swaps the axes itself).
+        let (x, y) = if self.shift && !cfg!(target_os = "macos") { (y, x) } else { (x, y) };
+        Some(Action::publish(Message::WheelScroll(Vector::new(-x, -y) * self.notch)).and_capture())
     }
 
     fn draw(&self, _: &(), _: &Renderer, _: &Theme, _: Rectangle, _: Cursor) -> Vec<Geometry> {

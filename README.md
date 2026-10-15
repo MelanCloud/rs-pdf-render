@@ -9,8 +9,16 @@ It looks and behaves like Firefox's PDF viewer, minus everything a reader doesn'
 - Rotate counterclockwise.
 - The document outline in a sidebar.
 - A simple pen with four colors and undo.
-- Print, with the drawings included.
+- Open and Print in a small menu (the ☰ button). Printing includes the drawings.
+- Links in the PDF work: page links jump there, web links open in your browser.
+- Back and Forward after following a link or outline entry, or typing a page.
+- Each file reopens where you left it, at the same zoom and rotation.
 - Password-protected PDFs: it asks for the password, like Firefox.
+- Settings (the gear button): light, dark or system theme, smooth scrolling,
+  sliding or instant toolbars, always-visible toolbars, the zoom for new files
+  (Automatic, Page fit, Page width, 100%) and the scroll speed per wheel notch.
+  Smooth scrolling and sliding toolbars start off when Windows' "Animation
+  effects" are off.
 
 ## Keyboard shortcuts
 
@@ -21,12 +29,15 @@ On macOS, use ⌘ instead of Ctrl.
 | Ctrl+O | Open a PDF (or drop one on the window) |
 | Ctrl+P | Print |
 | Ctrl++ / Ctrl+- | Zoom in / out |
-| Ctrl+0 | Automatic zoom |
+| Ctrl+0 | Back to the default zoom |
 | Ctrl + mouse wheel | Zoom around the mouse |
 | Home / End | First / last page |
 | Page Up / Page Down / Space | Scroll a screen |
+| Up / Down | Scroll a little |
 | Ctrl+Z | Undo the last drawing |
-| Esc | Stop drawing, or close the password box |
+| Ctrl+Shift+Z | Redo |
+| Alt+Left / Alt+Right | Back / Forward (also the mouse's side buttons; ⌘[ and ⌘] on macOS) |
+| Esc | Close a menu or the password box, or stop drawing |
 
 ## Building
 
