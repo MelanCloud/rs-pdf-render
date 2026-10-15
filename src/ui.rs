@@ -391,9 +391,15 @@ fn page<'a>(app: &'a App, doc: &'a Document, index: usize) -> Element<'a, Messag
     let size = doc.page_size(index);
     let mut layers = stack![].width(size.width).height(size.height);
 
-    if let Some((_, handle)) = &page.image {
+    if let Some((bitmap, handle)) = &page.image {
         let turn = Rotation::Solid(Radians(f32::from(doc.rotation).to_radians()));
-        layers = layers.push(image(handle.clone()).width(Fill).height(Fill).rotation(turn));
+        // Shown at exactly its rendered size (nearly always), the bitmap is
+        // copied pixel for pixel: blending would smear text whenever the page
+        // sits between pixel rows, which smooth scrolling and exact jumps
+        // cause. Stretched (mid-zoom, or past the size cap) it blends.
+        let exact = (bitmap.width as f32 - page.size.width * doc.zoom * PT_TO_PX * app.scale_factor).abs() < 1.0;
+        let filter = if exact { image::FilterMethod::Nearest } else { image::FilterMethod::Linear };
+        layers = layers.push(image(handle.clone()).width(Fill).height(Fill).rotation(turn).filter_method(filter));
     }
     // The sharp part in view, when zoomed in too far to render the page whole.
     if let Some((detail, handle)) = &page.detail
@@ -401,7 +407,10 @@ fn page<'a>(app: &'a App, doc: &'a Document, index: usize) -> Element<'a, Messag
         && (detail.page_width as f32 - size.width * app.scale_factor).abs() < 1.0
     {
         let s = app.scale_factor;
-        let patch = image(handle.clone()).width(detail.width as f32 / s).height(detail.height as f32 / s);
+        let patch = image(handle.clone())
+            .width(detail.width as f32 / s)
+            .height(detail.height as f32 / s)
+            .filter_method(image::FilterMethod::Nearest);
         let at = iced::Padding::ZERO.top(detail.y as f32 / s).left(detail.x as f32 / s);
         layers = layers.push(container(patch).padding(at));
     }
