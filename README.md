@@ -110,6 +110,11 @@ On macOS, use ⌘ instead of Ctrl.
 | Esc | Close a menu, the password box or the find bar, or stop drawing |
 | Enter | Apply what you typed in the page, zoom or password box |
 
+Enable **Settings → Slide navigation** to jump immediately to the next or
+previous page with each vertical wheel notch or arrow key. Page Up, Page Down
+and Space also jump by page in this mode. Ctrl+wheel still zooms and
+Shift+wheel still scrolls horizontally. The setting is remembered between launches.
+
 Drag the top or bottom bar to move the window, and double-click it to
 maximize.
 

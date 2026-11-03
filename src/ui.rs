@@ -388,8 +388,8 @@ fn document<'a>(app: &'a App, doc: &'a Document) -> Element<'a, Message> {
         .height(Fill);
 
     let wheel = Wheel {
-        zoom: app.modifiers.command() || app.modifiers.control(),
-        shift: app.modifiers.shift(),
+        modifiers: app.modifiers,
+        slide_navigation: app.settings.slide_navigation,
         notch: app.settings.scroll_speed,
     };
     stack![scroller, canvas(wheel).width(Fill).height(Fill)].into()
@@ -661,6 +661,8 @@ fn settings(app: &App) -> Element<'_, Message> {
     let menu = column![
         text("Theme").size(12).style(muted),
         themes,
+        switch(app.settings.slide_navigation, "Slide navigation", Message::SetSlideNavigation),
+        text("Wheel and arrow keys jump one page at a time.").size(12).style(muted),
         switch(app.settings.smooth_scrolling, "Smooth scrolling", Message::SetSmoothScrolling),
         switch(app.settings.animate_toolbars, "Animate toolbars", Message::SetAnimateToolbars),
         switch(app.settings.always_show_toolbars, "Always show toolbars", Message::SetAlwaysShowToolbars),

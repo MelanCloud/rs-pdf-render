@@ -64,6 +64,8 @@ pub struct Settings {
     pub theme: ThemeChoice,
     /// Mouse wheel notches and arrow/page keys glide instead of jumping.
     pub smooth_scrolling: bool,
+    /// Wheel and navigation keys jump immediately between pages.
+    pub slide_navigation: bool,
     /// The toolbars slide in and out instead of appearing at once.
     pub animate_toolbars: bool,
     /// The toolbars never hide.
@@ -85,6 +87,7 @@ impl Settings {
         let mut settings = Self {
             theme: ThemeChoice::System,
             smooth_scrolling: animations,
+            slide_navigation: false,
             animate_toolbars: animations,
             always_show_toolbars: false,
             default_zoom: Zoom::Automatic,
@@ -106,6 +109,7 @@ impl Settings {
                     }
                 }
                 "smooth_scrolling" => settings.smooth_scrolling = on,
+                "slide_navigation" => settings.slide_navigation = on,
                 "animate_toolbars" => settings.animate_toolbars = on,
                 "always_show_toolbars" => settings.always_show_toolbars = on,
                 "default_zoom" => settings.default_zoom = Zoom::from_key(value).unwrap_or(Zoom::Automatic),
@@ -126,9 +130,10 @@ impl Settings {
     pub fn save(&self) {
         let switch = |on: bool| if on { "on" } else { "off" };
         let text = format!(
-            "theme={}\nsmooth_scrolling={}\nanimate_toolbars={}\nalways_show_toolbars={}\ndefault_zoom={}\nscroll_speed={}\nscan_subsections={}\n",
+            "theme={}\nsmooth_scrolling={}\nslide_navigation={}\nanimate_toolbars={}\nalways_show_toolbars={}\ndefault_zoom={}\nscroll_speed={}\nscan_subsections={}\n",
             self.theme.label().to_lowercase(),
             switch(self.smooth_scrolling),
+            switch(self.slide_navigation),
             switch(self.animate_toolbars),
             switch(self.always_show_toolbars),
             self.default_zoom.key(),

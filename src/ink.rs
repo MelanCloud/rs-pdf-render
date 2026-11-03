@@ -4,6 +4,7 @@
 use crate::Message;
 use crate::pdf::{Link, PageText};
 use iced::mouse::{self, Cursor};
+use iced::{keyboard, window};
 use iced::widget::canvas::{self, Action, Event, Frame, Geometry, Path, Program};
 use iced::{Color, Point, Rectangle, Renderer, Size, Theme, Vector};
 
@@ -267,39 +268,204 @@ impl Program<Message> for Overlay<'_> {
     }
 }
 
+/// Sideways wheel scrolling moves this share of a notch: a page is far less
+/// wide than tall, so a full notch overshoots.
+const SIDEWAYS: f32 = 0.25;
+
 /// Invisible layer over the document that turns Ctrl/Cmd + wheel into zoom,
 /// and mouse wheel notches into scrolling at the chosen speed (gliding when
 /// smooth scrolling is on), before the scroll area sees them. Trackpads (pixel
-/// deltas) keep scrolling natively, as in Chromium.
+/// deltas) keep scrolling natively outside slide navigation.
 pub struct Wheel {
-    pub zoom: bool,
-    pub shift: bool,
+    pub modifiers: keyboard::Modifiers,
+    pub slide_navigation: bool,
     /// Pixels per notch.
     pub notch: f32,
 }
 
-impl Program<Message> for Wheel {
-    type State = ();
+/// Keep input state here: multiple events can reach the canvas before the
+/// application processes subscription messages and rebuilds the view.
+#[derive(Default)]
+pub struct WheelState {
+    modifiers: Option<keyboard::Modifiers>,
+    pixels: f32,
+    last_pixel: Option<iced::time::Instant>,
+}
 
-    fn update(&self, _: &mut (), event: &Event, bounds: Rectangle, cursor: Cursor) -> Option<Action<Message>> {
+impl Program<Message> for Wheel {
+    type State = WheelState;
+
+    fn update(
+        &self,
+        state: &mut WheelState,
+        event: &Event,
+        bounds: Rectangle,
+        cursor: Cursor,
+    ) -> Option<Action<Message>> {
+        match event {
+            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers))
+            | Event::Keyboard(keyboard::Event::KeyPressed { modifiers, .. })
+            | Event::Keyboard(keyboard::Event::KeyReleased { modifiers, .. }) => {
+                state.modifiers = Some(*modifiers);
+                state.pixels = 0.0;
+                return None;
+            }
+            Event::Window(window::Event::Unfocused) => {
+                *state =
+                    WheelState { modifiers: Some(keyboard::Modifiers::default()), ..WheelState::default() };
+                return None;
+            }
+            _ => {}
+        }
         let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event else {
             return None;
         };
         let at = cursor.position_in(bounds)?;
-        if self.zoom {
+        let modifiers = state.modifiers.unwrap_or(self.modifiers);
+        if modifiers.command() || modifiers.control() {
             let y = match delta {
                 mouse::ScrollDelta::Lines { y, .. } => *y,
                 mouse::ScrollDelta::Pixels { y, .. } => *y / 40.0,
             };
             return Some(Action::publish(Message::WheelZoom(y, at)).and_capture());
         }
-        let mouse::ScrollDelta::Lines { x, y } = *delta else { return None };
+        let (x, y, pixels) = match *delta {
+            mouse::ScrollDelta::Lines { x, y } => (x, y, false),
+            mouse::ScrollDelta::Pixels { x, y } => (x, y, true),
+        };
         // Shift scrolls sideways, as in the scroll area (macOS swaps the axes itself).
-        let (x, y) = if self.shift && !cfg!(target_os = "macos") { (y, x) } else { (x, y) };
-        Some(Action::publish(Message::WheelScroll(Vector::new(-x, -y) * self.notch)).and_capture())
+        let (x, y) = if modifiers.shift() && !cfg!(target_os = "macos") { (y, x) } else { (x, y) };
+        if self.slide_navigation && !modifiers.shift() && y != 0.0 {
+            if pixels {
+                let now = iced::time::Instant::now();
+                if state.last_pixel.is_none_or(|last| now.duration_since(last).as_millis() > 200)
+                    || state.pixels.signum() != y.signum()
+                {
+                    state.pixels = 0.0;
+                }
+                state.last_pixel = Some(now);
+                state.pixels += y;
+                if state.pixels.abs() < 40.0 {
+                    return Some(Action::capture());
+                }
+                state.pixels %= 40.0;
+            }
+            return Some(Action::publish(Message::SlideStep(y < 0.0)).and_capture());
+        }
+        if pixels {
+            return None;
+        }
+        let delta = Vector::new(-x * SIDEWAYS, -y) * self.notch;
+        Some(Action::publish(Message::WheelScroll(delta)).and_capture())
     }
 
-    fn draw(&self, _: &(), _: &Renderer, _: &Theme, _: Rectangle, _: Cursor) -> Vec<Geometry> {
+    fn draw(&self, _: &WheelState, _: &Renderer, _: &Theme, _: Rectangle, _: Cursor) -> Vec<Geometry> {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn send(wheel: &Wheel, state: &mut WheelState, event: Event) -> Option<Message> {
+        wheel
+            .update(
+                state,
+                &event,
+                Rectangle::with_size(Size::new(100.0, 100.0)),
+                Cursor::Available(Point::new(50.0, 50.0)),
+            )
+            .and_then(|action| action.into_inner().0)
+    }
+
+    fn notch() -> Event {
+        Event::Mouse(mouse::Event::WheelScrolled { delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 } })
+    }
+
+    #[test]
+    fn released_modifier_applies_to_first_notch_before_view_rebuild() {
+        for modifier in [keyboard::Modifiers::CTRL, keyboard::Modifiers::SHIFT] {
+            // The view still says the modifier is held when release and wheel
+            // arrive in one batch. The canvas state must override that view.
+            let wheel = Wheel { modifiers: modifier, slide_navigation: false, notch: 60.0 };
+            let mut state = WheelState::default();
+            send(&wheel, &mut state, Event::Keyboard(keyboard::Event::ModifiersChanged(modifier)));
+            let held = send(&wheel, &mut state, notch());
+            if modifier.control() {
+                assert!(matches!(held, Some(Message::WheelZoom(..))));
+            } else if !cfg!(target_os = "macos") {
+                assert!(matches!(held, Some(Message::WheelScroll(v)) if v.x > 0.0 && v.y == 0.0));
+            }
+            send(
+                &wheel,
+                &mut state,
+                Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::default())),
+            );
+            assert!(
+                matches!(send(&wheel, &mut state, notch()), Some(Message::WheelScroll(v)) if v.x == 0.0 && v.y == 60.0)
+            );
+        }
+    }
+
+    #[test]
+    fn slide_navigation_preserves_zoom_and_shift_scroll() {
+        let wheel = Wheel { modifiers: keyboard::Modifiers::default(), slide_navigation: true, notch: 60.0 };
+        let mut state = WheelState::default();
+        assert!(matches!(send(&wheel, &mut state, notch()), Some(Message::SlideStep(true))));
+        let up =
+            Event::Mouse(mouse::Event::WheelScrolled { delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 } });
+        assert!(matches!(send(&wheel, &mut state, up), Some(Message::SlideStep(false))));
+        send(
+            &wheel,
+            &mut state,
+            Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::CTRL)),
+        );
+        assert!(matches!(send(&wheel, &mut state, notch()), Some(Message::WheelZoom(..))));
+        send(
+            &wheel,
+            &mut state,
+            Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::SHIFT)),
+        );
+        assert!(matches!(send(&wheel, &mut state, notch()), Some(Message::WheelScroll(_))));
+        send(
+            &wheel,
+            &mut state,
+            Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::default())),
+        );
+        assert!(matches!(send(&wheel, &mut state, notch()), Some(Message::SlideStep(true))));
+    }
+
+    #[test]
+    fn trackpad_accumulates_small_deltas_only_in_slide_mode() {
+        let mut wheel =
+            Wheel { modifiers: keyboard::Modifiers::default(), slide_navigation: true, notch: 60.0 };
+        let mut state = WheelState::default();
+        let pixel = Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Pixels { x: 0.0, y: -10.0 },
+        });
+        for _ in 0..3 {
+            assert!(send(&wheel, &mut state, pixel.clone()).is_none());
+        }
+        assert!(matches!(send(&wheel, &mut state, pixel.clone()), Some(Message::SlideStep(true))));
+        wheel.slide_navigation = false;
+        assert!(
+            wheel
+                .update(
+                    &mut state,
+                    &pixel,
+                    Rectangle::with_size(Size::new(100.0, 100.0)),
+                    Cursor::Available(Point::new(50.0, 50.0))
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn focus_loss_clears_held_modifiers() {
+        let wheel = Wheel { modifiers: keyboard::Modifiers::CTRL, slide_navigation: false, notch: 60.0 };
+        let mut state = WheelState::default();
+        send(&wheel, &mut state, Event::Window(window::Event::Unfocused));
+        assert!(matches!(send(&wheel, &mut state, notch()), Some(Message::WheelScroll(_))));
     }
 }

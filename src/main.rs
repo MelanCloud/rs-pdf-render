@@ -294,6 +294,8 @@ pub enum Message {
     WheelZoom(f32, Point),
     /// A mouse wheel notch to scroll smoothly.
     WheelScroll(Vector),
+    /// Move one slide forward or backward, without animation.
+    SlideStep(bool),
     PageInput(String),
     PageSubmit,
     /// Go to a page (and a spot on it) from the outline, remembering the way back.
@@ -343,6 +345,7 @@ pub enum Message {
     Pressed,
     SetTheme(ThemeChoice),
     SetSmoothScrolling(bool),
+    SetSlideNavigation(bool),
     SetAnimateToolbars(bool),
     SetAlwaysShowToolbars(bool),
     SetDefaultZoom(Zoom),
@@ -658,6 +661,7 @@ impl App {
                 }
             }
             Message::WheelScroll(delta) => return self.scroll_by(delta),
+            Message::SlideStep(forward) => return self.step_slide(forward),
             Message::WheelZoom(steps, at) => {
                 if let Some(doc) = &self.doc {
                     return self.zoom(doc.zoom * 1.1f32.powf(steps), Some(at));
@@ -930,6 +934,14 @@ impl App {
                 self.settings.smooth_scrolling = on;
                 self.settings.save();
             }
+            Message::SetSlideNavigation(on) => {
+                self.settings.slide_navigation = on;
+                self.settings.save();
+                if let Some(doc) = &mut self.doc {
+                    doc.glide = None;
+                }
+                return self.sync_renders();
+            }
             Message::SetAnimateToolbars(on) => {
                 self.settings.animate_toolbars = on;
                 self.settings.save();
@@ -1010,6 +1022,10 @@ impl App {
                 let last = self.doc.as_ref().map_or(0, |doc| doc.pages.len() - 1);
                 return self.go_to(last);
             }
+            Key::Named(Named::ArrowDown | Named::ArrowRight | Named::PageDown | Named::Space)
+                if self.settings.slide_navigation => return self.step_slide(true),
+            Key::Named(Named::ArrowUp | Named::ArrowLeft | Named::PageUp)
+                if self.settings.slide_navigation => return self.step_slide(false),
             Key::Named(Named::PageDown | Named::Space) => return self.scroll_by(Vector::new(0.0, page_height)),
             Key::Named(Named::PageUp) => return self.scroll_by(Vector::new(0.0, -page_height)),
             Key::Named(Named::ArrowDown) => return self.scroll_by(Vector::new(0.0, 40.0)),
@@ -1243,6 +1259,16 @@ impl App {
         Task::batch([task, self.scroll_to(self.doc.as_ref().map_or(Vector::ZERO, |doc| doc.offset))])
     }
 
+    fn step_slide(&mut self, forward: bool) -> Task<Message> {
+        let Some(doc) = &self.doc else { return Task::none() };
+        let page = if forward {
+            (doc.current + 1).min(doc.pages.len() - 1)
+        } else {
+            doc.current.saturating_sub(1)
+        };
+        self.go_to(page)
+    }
+
     fn go_to(&mut self, page: usize) -> Task<Message> {
         let Some(doc) = &mut self.doc else { return Task::none() };
         doc.page_input = None;
@@ -1332,8 +1358,8 @@ impl App {
         let (Some(doc), Ok(worker)) = (&mut self.doc, &self.pdf) else { return Task::none() };
 
         let tops = doc.tops();
-        // Render half a screen past each edge so scrolling rarely shows a blank page.
-        let (near_start, near_end) = (doc.offset.y - view.height / 2.0, doc.offset.y + 1.5 * view.height);
+        let heights: Vec<_> = (0..doc.pages.len()).map(|index| doc.page_size(index).height).collect();
+        let render_order = pages_to_render(&tops, &heights, doc.offset.y, view.height, self.settings.slide_navigation);
         let (view_start, view_end) = (doc.offset.y, doc.offset.y + view.height);
         // Like pdf.js: stay on the current page while all of it shows, otherwise
         // pick the page with the biggest share showing (the first one on ties).
@@ -1344,7 +1370,22 @@ impl App {
         let content_width = doc.content_size(view).width;
         let mut tasks = Vec::new();
 
-        for (index, top) in tops.into_iter().enumerate() {
+        // Evict only outside the planned window. In slide mode this retains
+        // complete neighboring pages even when only an edge was near the view.
+        for (index, page) in doc.pages.iter_mut().enumerate() {
+            if !render_order.contains(&index) {
+                page.image = None;
+                page.pending = None;
+                page.detail = None;
+                page.pending_detail = None;
+                page.text = None;
+                page.text_pending = false;
+            }
+        }
+
+        // Visible pages enter the worker queue before speculative neighbors.
+        for index in render_order {
+            let top = tops[index];
             let size = doc.page_size(index);
             let bottom = top + size.height;
             let shown = (bottom.min(view_end) - top.max(view_start)) / size.height;
@@ -1353,24 +1394,6 @@ impl App {
                 most_visible = (shown, index);
             }
             let page = &mut doc.pages[index];
-            if bottom < near_start || top > near_end {
-                page.image = None;
-                page.pending = None;
-                page.detail = None;
-                page.pending_detail = None;
-                page.text = None;
-                page.text_pending = false;
-                continue;
-            }
-            if page.text.is_none() && !page.text_pending {
-                page.text_pending = true;
-                let id = doc.id;
-                tasks.push(Task::perform(worker.clone().text(index), move |text| Message::TextLoaded {
-                    doc: id,
-                    page: index,
-                    text,
-                }));
-            }
 
             let full_width = page.size.width * doc.zoom * PT_TO_PX * scale_factor;
             let pixels = full_width * full_width * page.size.height / page.size.width;
@@ -1421,14 +1444,23 @@ impl App {
                 }
             }
             wanted.insert(index, bitmap);
-            if page.image.as_ref().is_some_and(|(have, _)| *have == bitmap) || page.pending == Some(bitmap) {
-                continue;
+            if !page.image.as_ref().is_some_and(|(have, _)| *have == bitmap) && page.pending != Some(bitmap) {
+                page.pending = Some(bitmap);
+                let id = doc.id;
+                tasks.push(Task::perform(worker.clone().render(index, bitmap), move |rendered| {
+                    Message::Rendered { doc: id, page: index, bitmap, rendered }
+                }));
             }
-            page.pending = Some(bitmap);
-            let id = doc.id;
-            tasks.push(Task::perform(worker.clone().render(index, bitmap), move |rendered| {
-                Message::Rendered { doc: id, page: index, bitmap, rendered }
-            }));
+            if page.text.is_none() && !page.text_pending {
+                page.text_pending = true;
+                let id = doc.id;
+                tasks.push(Task::perform(worker.clone().text(index), move |text| Message::TextLoaded {
+                    doc: id,
+                    page: index,
+                    text,
+                }));
+            }
+
         }
 
         if !keep_current {
@@ -1437,6 +1469,29 @@ impl App {
         worker.set_wanted(wanted, wanted_details);
         Task::batch(tasks)
     }
+}
+
+
+/// Continuous scrolling needs a small pixel margin. Slide navigation needs
+/// whole pages on either side, even when zoom makes them taller than the view.
+fn pages_to_render(tops: &[f32], heights: &[f32], start: f32, height: f32, slides: bool) -> Vec<usize> {
+    if tops.is_empty() {
+        return Vec::new();
+    }
+    let end = start + height;
+    let first = tops.partition_point(|&top| top <= start).saturating_sub(1);
+    let last = tops.partition_point(|&top| top < end).saturating_sub(1);
+    let neighbors = first.saturating_sub(2)..=last.saturating_add(2).min(tops.len() - 1);
+    let mut pages: Vec<_> = (0..tops.len()).filter(|&index| {
+        let near = tops[index] + heights[index] >= start - height / 2.0
+            && tops[index] <= end + height / 2.0;
+        near || (slides && neighbors.contains(&index))
+    }).collect();
+    pages.sort_by_key(|&index| {
+        let visible = tops[index] < end && tops[index] + heights[index] > start;
+        (!visible, index.abs_diff(first))
+    });
+    pages
 }
 
 impl Document {
@@ -1507,4 +1562,38 @@ fn keep_collapsed(old: &[OutlineEntry], collapsed: &HashSet<usize>, new: &[Outli
         }
     }
     result
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::pages_to_render;
+
+    #[test]
+    fn slide_cache_keeps_two_whole_neighbors_at_high_zoom() {
+        let tops = [10.0, 2020.0, 4030.0, 6040.0, 8050.0, 10060.0, 12070.0];
+        let heights = [2000.0; 7];
+        let pages = pages_to_render(&tops, &heights, 6040.0, 600.0, true);
+        assert_eq!(pages, vec![3, 2, 4, 1, 5]);
+        let next = pages_to_render(&tops, &heights, 8050.0, 600.0, true);
+        // Advancing retains the page we left and already has the destination.
+        assert!(pages.contains(&4));
+        assert!(next.contains(&3));
+        assert!(!next.contains(&1));
+    }
+
+    #[test]
+    fn continuous_mode_keeps_its_small_render_window() {
+        let tops = [10.0, 2020.0, 4030.0, 6040.0, 8050.0];
+        assert_eq!(pages_to_render(&tops, &[2000.0; 5], 4030.0, 600.0, false), vec![2, 1]);
+    }
+
+    #[test]
+    fn visible_pages_render_before_neighbors_and_bounds_are_clamped() {
+        let tops = [10.0, 220.0, 430.0, 640.0, 850.0, 1060.0];
+        let pages = pages_to_render(&tops, &[200.0; 6], 220.0, 600.0, true);
+        assert_eq!(&pages[..3], &[1, 2, 3]);
+        assert_eq!(pages.len(), 6);
+        assert_eq!(pages_to_render(&[10.0], &[2000.0], 0.0, 600.0, true), vec![0]);
+        assert!(pages_to_render(&[], &[], 0.0, 600.0, true).is_empty());
+    }
 }
