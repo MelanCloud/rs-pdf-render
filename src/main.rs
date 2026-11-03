@@ -480,7 +480,7 @@ impl App {
                 self.scale_factor = scale;
                 let size = window::size(id).map(Message::FirstSize);
                 #[cfg(windows)]
-                return Task::batch([size, window::run(id, system::fit_drawing_area).discard()]);
+                return Task::batch([size, window::run(id, system::configure_window).discard()]);
                 #[cfg(not(windows))]
                 return size;
             }

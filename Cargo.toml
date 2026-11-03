@@ -1,6 +1,6 @@
 [package]
 name = "rs-pdf-render"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "An ultralightweight PDF reader"
 license = "AGPL-3.0-or-later"
@@ -23,7 +23,7 @@ raw-window-handle = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_UI_Controls_Dialogs", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_UI_Controls_Dialogs", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
